@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -813,6 +814,24 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             return 0;
         }
         g_kv_host_bytes += bytes;
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+        // ROCm's mapped host allocation is anonymous memory the GPU reaches through HMM, not pinned pages: under memory
+        // pressure (zram, swappiness > 100) the kernel may swap it out, and each invalidation stalls the GPU's queues
+        // while amdgpu re-walks the range (the expert complement's mlock in FileExpertSource, local patch).  The KV copy
+        // the streamed attention reads is locked the same way.
+        {
+            static uint64_t locked_total = 0, asked_total = 0;
+            const strata::platform::LockResult lr = strata::platform::lock_resident(h, bytes);
+            asked_total += bytes;
+            if (lr.ok) locked_total += lr.locked_bytes;
+            if (!lr.ok || lr.locked_bytes < bytes)
+                std::fprintf(stderr, "strata: KV streaming: the layer's pinned KV copy could not be mlock'd fully (%s)\n",
+                             lr.note.c_str());
+            else if (asked_total == bytes)
+                std::fprintf(stderr, "strata: KV streaming: the pinned KV copies are mlock'd (ROCm maps them without "
+                                     "pinning)\n");
+        }
+#endif
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
