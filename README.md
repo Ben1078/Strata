@@ -1,3 +1,7 @@
+> **Fork branch `rdna3-moe-offload-perf`:** performance work for Qwen3.8-Flash-Next at a usable quant
+> (UD-Q5_K_XL) on one RX 7900 XTX + system RAM - ~58 tok/s decode vs ~36 stock, 2-3x faster long-chat turns.
+> See [RDNA3_MOE_OFFLOAD.md](RDNA3_MOE_OFFLOAD.md). Upstream project: [Niko1221/Strata](https://github.com/Niko1221/Strata).
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
