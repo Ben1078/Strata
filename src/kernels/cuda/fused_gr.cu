@@ -321,6 +321,18 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     const int d0 = blockIdx.x * UPM_COLS;
     for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
     __syncthreads();
+#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)
+    // gfx10+ HIP, 2+ tokens: a row's T warp sums as ONE transposed butterfly (s26_tsum.cuh, DPP moves): the same pairs
+    // added, and every lane of a xor butterfly holds the same bits, so token k's sum is the same wherever it ends - its
+    // owner lane tsum_lane(k) runs that token's epilogue.  Bitwise the per-token trees; 1-3 us less per call at 4-6 tokens
+    // on the RX 7900 XTX.
+    constexpr bool TS = EXACT_T && MAX_T >= 2;
+#else
+    constexpr bool TS = false;
+#endif
+    constexpr int P = s26ts::pow2_ceil(MAX_T);
+    const int tk = TS ? s26ts::tsum_token<P>(lane) : lane;
+    const bool owner = TS ? (lane == s26ts::tsum_lane<P>(tk) && tk < T) : lane < T;
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
@@ -329,8 +341,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
         // the epilogue inputs of this lane's token, fetched while the dots run
         float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
         bool apply = false;
-        if (lane < T) {
-            const FusedGrArgs& a = m.a[lane];
+        if (owner) {
+            const FusedGrArgs& a = m.a[tk];
             rv = a.R[i];
             wn = a.w_norm[i];
             rsc = a.rs[c];
@@ -338,6 +350,17 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
             if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
         }
         float mine = 0.0f;
+        if constexpr (TS) {
+            float acc[P];
+#pragma unroll
+            for (int k = 0; k < P; ++k) acc[k] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < MAX_T; ++k) {
+                acc[k] = dot8u_ptr(wa, lo[k] + lane * 8);
+                if (lane < LR / 8 - 32) acc[k] += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
+            }
+            mine = s26ts::tsum<P>(acc, lane);
+        } else {
 #pragma unroll
         for (int k = 0; k < MAX_T; ++k) {
             if (!EXACT_T && k >= T) break;
@@ -346,13 +369,14 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
             acc = warp_sum(acc);
             if (lane == k) mine = acc;
         }
-        if (lane < T) {
+        }
+        if (owner) {
             if (apply) {
                 rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                m.a[lane].R_out[i] = rv;
+                m.a[tk].R_out[i] = rv;
             }
             const float x = rv * wn * rsc;
-            g[lane][c][dd] = x * sigmoidf_(mine);
+            g[tk][c][dd] = x * sigmoidf_(mine);
         }
     }
     __syncthreads();

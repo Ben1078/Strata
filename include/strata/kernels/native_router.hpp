@@ -16,4 +16,11 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// native_router_top10_multi (n_tok <= 8) and then doorbell_publish_res (elementwise.hpp) of its ids in ONE launch:
+/// ids/weights as the top-10, ids_out / x_out (the n floats of x, when an id is not resident in d_res) / the ring
+/// d_seq as the doorbell.  Bitwise the two launches.  ring != 0: d_seq is set to ring (the step's number, which the
+/// read-modify-write of a ring reset at the window's start leaves) without reading it back over PCIe.
+void native_router_top10_doorbell(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
+                                  const int32_t* d_res, int n_expert, int64_t n, float* x_out, int32_t* ids_out,
+                                  uint32_t* d_seq, uint32_t ring, void* stream);
 }

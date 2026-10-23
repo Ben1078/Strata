@@ -28,6 +28,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "s26_tsum.cuh"
+#include "q8_wave32.cuh"
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
 #endif
@@ -2394,10 +2395,126 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     return true;
 }
 
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// ---- gfx10+/wave32 Q8_0 x q8_1 for 1..8 columns (q8_wave32.cuh), bitwise the kernels above.  Measured on the RX 7900 XTX
+// (2-4 columns, weights rotated past the Infinity Cache): 2560 -> 6144 24 vs 29-32 us, 2560 -> 10240 37-39 vs 39-44 us,
+// 2560 -> 12288 43-46 vs 47-51 us, 6144 -> 2560 equal.  STRATA_MMVQ_Q8W=0: the old kernels.
+namespace q8w {
+bool enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_Q8W"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+}  // namespace q8w
+namespace {
+template <int NC, int R>
+__global__ void __launch_bounds__(128) native_q8_0_wave32_kernel(const q8w::Q80* __restrict__ w, const q8w::Q81* __restrict__ x,
+                                                                 float* __restrict__ y, int n_in, int n_out) {
+    const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5)) * R;
+    if (row0 >= n_out) return;
+    q8w::rows<NC, R>(w, x, y, n_in, n_out, row0, int(threadIdx.x) & 31);
+}
+template <int R>
+void q8w_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    const unsigned blocks = unsigned(((n_out + R - 1) / R + 3) / 4);
+    const auto* w = static_cast<const q8w::Q80*>(weights);
+    const auto* x = static_cast<const q8w::Q81*>(x_q8_1);
+    switch (ncols) {
+        case 1: native_q8_0_wave32_kernel<1, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 2: native_q8_0_wave32_kernel<2, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 3: native_q8_0_wave32_kernel<3, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 4: native_q8_0_wave32_kernel<4, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 5: native_q8_0_wave32_kernel<5, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 6: native_q8_0_wave32_kernel<6, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        case 7: native_q8_0_wave32_kernel<7, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+        default: native_q8_0_wave32_kernel<8, R><<<blocks, 128, 0, s>>>(w, x, y, n_in, n_out); break;
+    }
+}
+// the projections (n_out up to 12288): two rows a wave; the heads (106K / 248K rows): one row a wave, and a single
+// column keeps native_small_mmvq_kernel (a block a row: 750 vs 790 us for the 248K head, 330 vs 336 us for the draft's)
+bool q8w_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!q8w::enabled() || n_in <= 0 || n_in % 32 != 0 || n_out <= 0 || ncols < 1 || ncols > 8) return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (n_out >= 65536) {
+        if (ncols == 1) return false;
+        q8w_launch<1>(weights, x_q8_1, y, n_in, n_out, ncols, s);
+    } else {
+        q8w_launch<2>(weights, x_q8_1, y, n_in, n_out, ncols, s);
+    }
+    launch_check();
+    return true;
+}
+// up to 4 Q8_0 matrices of one input in one launch (each block's rows belong to one of them): bitwise q8w_mmvq per matrix
+struct Q8wGroup {
+    const q8w::Q80* w[4];
+    float* y[4];
+    int n_out[4];
+    int first[5];   // first block of each matrix; first[n] = all blocks
+    int n;
+};
+template <int NC>
+__global__ void __launch_bounds__(128) native_q8_0_wave32_group_kernel(Q8wGroup g, const q8w::Q81* __restrict__ x, int n_in) {
+    const int b = int(blockIdx.x);
+    int m = 0;
+#pragma unroll
+    for (int i = 1; i < 4; ++i) m += (i < g.n && b >= g.first[i]) ? 1 : 0;
+    const int row0 = ((b - g.first[m]) * 4 + (int(threadIdx.x) >> 5)) * 2;
+    if (row0 >= g.n_out[m]) return;
+    q8w::rows<NC, 2>(g.w[m], x, g.y[m], n_in, g.n_out[m], row0, int(threadIdx.x) & 31);
+}
+}  // namespace
+#endif
+
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    validate_shape(n_in, ncols, 32);
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    if (q8w_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;
+#endif
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+bool native_q8_0_mmvq_group(const NativeQ8Job* jobs, int n_jobs, const void* x_q8_1, int n_in, int ncols, void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (!q8w::enabled() || n_jobs < 1 || n_jobs > 4 || n_in <= 0 || n_in % 32 != 0 || ncols < 1 || ncols > 8) return false;
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    Q8wGroup g{};
+    int blocks = 0;
+    for (int i = 0; i < n_jobs; ++i) {
+        if (jobs[i].weights == nullptr || jobs[i].y == nullptr || jobs[i].n_out <= 0) return false;
+        validate_pointer(jobs[i].weights);
+        validate_pointer(jobs[i].y);
+        g.w[i] = static_cast<const q8w::Q80*>(jobs[i].weights);
+        g.y[i] = jobs[i].y;
+        g.n_out[i] = jobs[i].n_out;
+        g.first[i] = blocks;
+        blocks += ((jobs[i].n_out + 1) / 2 + 3) / 4;
+    }
+    g.first[n_jobs] = blocks;
+    g.n = n_jobs;
+    const auto* x = static_cast<const q8w::Q81*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: native_q8_0_wave32_group_kernel<1><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 2: native_q8_0_wave32_group_kernel<2><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 3: native_q8_0_wave32_group_kernel<3><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 4: native_q8_0_wave32_group_kernel<4><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 5: native_q8_0_wave32_group_kernel<5><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 6: native_q8_0_wave32_group_kernel<6><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        case 7: native_q8_0_wave32_group_kernel<7><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+        default: native_q8_0_wave32_group_kernel<8><<<unsigned(blocks), 128, 0, s>>>(g, x, n_in); break;
+    }
+    launch_check();
+    return true;
+#else
+    (void) jobs; (void) n_jobs; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream;
+    return false;
+#endif
 }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,

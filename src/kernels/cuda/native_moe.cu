@@ -95,6 +95,55 @@ __global__ void combine_k10_vec4(const float4* __restrict__ parts4, const float*
     sum.w += sh.w;
     output4[c4] = sum;
 }
+// The verify window's copy_rows_from_mapped + moe_hit_add + combine_k10_vec4 in one launch: part e of token tk is the
+// GPU's row (`0.0f + hit`: the zero fill and the add) when the plan lists it among the hit rows, else the CPU's row read
+// straight from the mapped buffer, then combine_k10_vec4's arithmetic.  Bitwise the three launches.
+__global__ void __launch_bounds__(128) combine_k10_mapped(const float4* mapped4, const float4* __restrict__ hit4,
+                                                          const int32_t* __restrict__ hit_rows,
+                                                          const int32_t* __restrict__ hit_count,
+                                                          const float* __restrict__ weights,
+                                                          const float4* __restrict__ shared4,
+                                                          float4* __restrict__ output4, int64_t n4) {
+    const int tk = (int) blockIdx.y;
+    __shared__ int gpu_row[10];
+    if (threadIdx.x < 10) {
+        const int r = tk * 10 + (int) threadIdx.x, c = *hit_count;
+        int h = 0;
+        for (int i = 0; i < c; ++i) h |= hit_rows[i] == r;
+        gpu_row[threadIdx.x] = h;
+    }
+    __syncthreads();
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    float4 p[10];
+#pragma unroll
+    for (int e = 0; e < 10; ++e) {
+        const int64_t off = int64_t(tk * 10 + e) * n4 + c4;
+        if (gpu_row[e]) {
+            const float4 h = hit4[off];
+            p[e] = make_float4(0.0f + h.x, 0.0f + h.y, 0.0f + h.z, 0.0f + h.w);
+        } else {
+            p[e] = mapped4[off];
+        }
+    }
+    weights += tk * 10;
+    const float w0 = __ldg(weights + 0);
+    float4 sum = make_float4(p[0].x * w0, p[0].y * w0, p[0].z * w0, p[0].w * w0);
+#pragma unroll
+    for (int e = 1; e < 10; ++e) {
+        const float w = __ldg(weights + e);
+        sum.x = fmaf(p[e].x, w, sum.x);
+        sum.y = fmaf(p[e].y, w, sum.y);
+        sum.z = fmaf(p[e].z, w, sum.z);
+        sum.w = fmaf(p[e].w, w, sum.w);
+    }
+    const float4 sh = shared4[int64_t(tk) * n4 + c4];
+    sum.x += sh.x;
+    sum.y += sh.y;
+    sum.z += sh.z;
+    sum.w += sh.w;
+    output4[int64_t(tk) * n4 + c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -166,5 +215,19 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
         hits, weights, shared, output, n_embd, int(k));
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+bool native_moe_combine_multi_mapped(const float* mapped_parts, const float* hits, const int32_t* hit_rows,
+                                     const int32_t* hit_count, const float* weights, const float* shared, float* output,
+                                     int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || k != 10 || shared == nullptr || n_tok < 1 || (n_embd & 3) != 0 ||
+        (((uintptr_t) mapped_parts | (uintptr_t) hits | (uintptr_t) shared | (uintptr_t) output) & 15u) != 0)
+        return false;
+    const int64_t n4 = n_embd >> 2;
+    combine_k10_mapped<<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float4*>(mapped_parts), reinterpret_cast<const float4*>(hits), hit_rows, hit_count, weights,
+        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    return true;
 }
 }

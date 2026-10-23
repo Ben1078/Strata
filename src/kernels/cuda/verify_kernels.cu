@@ -6,6 +6,7 @@
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "q8_wave32.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -886,6 +887,118 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
                                                                                                  channels, n_keep);
     check("gdn_conv_commit");
+}
+
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+namespace {
+// gdn_ab_multi_kernel<NC, true>'s warp for one row (alpha rows 0..h_v-1, beta rows h_v..2h_v-1), n = 2560 at compile time
+// (the 10 weight / activation loads of a lane in flight together) and the xor tree on DPP: bitwise that kernel
+template <int NC>
+__device__ __forceinline__ void gdn_ab_row(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                           const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                           float* __restrict__ beta, int h_v, int row, int lane) {
+    constexpr int n = 2560;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    float acc[NC];
+#pragma unroll
+    for (int t = 0; t < NC; ++t) acc[t] = 0.0f;
+#pragma unroll
+    for (int j = lane; j < n / 8; j += 32) {
+        const uint4 wv = __ldg(w4 + j);
+        const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
+        const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
+        const float w4f = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
+        const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+#pragma unroll
+        for (int t = 0; t < NC; ++t) {
+            const float* xt = x + (size_t) t * n;
+            const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
+            const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
+            float a = acc[t];
+            a = fmaf(w0, xa.x, a); a = fmaf(w1, xa.y, a);
+            a = fmaf(w2, xa.z, a); a = fmaf(w3, xa.w, a);
+            a = fmaf(w4f, xb.x, a); a = fmaf(w5, xb.y, a);
+            a = fmaf(w6, xb.z, a); a = fmaf(w7, xb.w, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NC; ++t) {
+        const float a = q8w::warp_sum(acc[t]);
+        if (lane != 0) continue;
+        if (is_beta) {
+            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+        } else {
+            const float v = a + dt[r];
+            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+        }
+    }
+}
+// The GDN mixer's input projections in ONE launch: blocks [0, qb) the qkv rows, [qb, qb + zb) the gate (z) rows (the wave32
+// Q8_0 rows of native_mmvq, two a wave), the rest the a/b rows (four a block): three independent products of one input
+struct GdnInProj {
+    const q8w::Q80* wq; float* yq; int nq, qb;
+    const q8w::Q80* wz; float* yz; int nz, zb;
+    const q8w::Q81* xq;
+    const float* x; const uint16_t* wa; const uint16_t* wb; const float* dt; const float* ssm_a; float* gate; float* beta;
+    int h_v;
+};
+template <int NC>
+__global__ void __launch_bounds__(128) gdn_in_proj_kernel(GdnInProj p) {
+    const int lane = (int) threadIdx.x & 31, warp = (int) threadIdx.x >> 5;
+    int b = (int) blockIdx.x;
+    if (b < p.qb) {
+        const int row0 = (b * 4 + warp) * 2;
+        if (row0 < p.nq) q8w::rows<NC, 2>(p.wq, p.xq, p.yq, 2560, p.nq, row0, lane);
+        return;
+    }
+    b -= p.qb;
+    if (b < p.zb) {
+        const int row0 = (b * 4 + warp) * 2;
+        if (row0 < p.nz) q8w::rows<NC, 2>(p.wz, p.xq, p.yz, 2560, p.nz, row0, lane);
+        return;
+    }
+    b -= p.zb;
+    const int row = b * 4 + warp;
+    if (row < 2 * p.h_v) gdn_ab_row<NC>(p.x, p.wa, p.wb, p.dt, p.ssm_a, p.gate, p.beta, p.h_v, row, lane);
+}
+}  // namespace
+#endif
+
+bool gdn_in_proj_fused(const void* w_qkv, float* y_qkv, int n_qkv, const void* w_z, float* y_z, int n_z, const void* xq,
+                       int n_in, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+                       const float* ssm_a, float* gate, float* beta, int h_v, int n_tok, void* stream) {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_INPROJ"); return v == nullptr || v[0] != '0'; }();
+    if (!on || !q8w::enabled() || n_in != 2560 || n_tok < 1 || n_tok > 8 || n_qkv <= 0 || n_z <= 0 || h_v <= 0) return false;
+    GdnInProj p;
+    p.wq = (const q8w::Q80*) w_qkv; p.yq = y_qkv; p.nq = n_qkv; p.qb = ((n_qkv + 1) / 2 + 3) / 4;
+    p.wz = (const q8w::Q80*) w_z; p.yz = y_z; p.nz = n_z; p.zb = ((n_z + 1) / 2 + 3) / 4;
+    p.xq = (const q8w::Q81*) xq;
+    p.x = x; p.wa = w_alpha; p.wb = w_beta; p.dt = dt; p.ssm_a = ssm_a; p.gate = gate; p.beta = beta; p.h_v = h_v;
+    const unsigned blocks = (unsigned) (p.qb + p.zb + (2 * h_v + 3) / 4);
+    cudaStream_t st = (cudaStream_t) stream;
+    switch (n_tok) {
+        case 1: gdn_in_proj_kernel<1><<<blocks, 128, 0, st>>>(p); break;
+        case 2: gdn_in_proj_kernel<2><<<blocks, 128, 0, st>>>(p); break;
+        case 3: gdn_in_proj_kernel<3><<<blocks, 128, 0, st>>>(p); break;
+        case 4: gdn_in_proj_kernel<4><<<blocks, 128, 0, st>>>(p); break;
+        case 5: gdn_in_proj_kernel<5><<<blocks, 128, 0, st>>>(p); break;
+        case 6: gdn_in_proj_kernel<6><<<blocks, 128, 0, st>>>(p); break;
+        case 7: gdn_in_proj_kernel<7><<<blocks, 128, 0, st>>>(p); break;
+        default: gdn_in_proj_kernel<8><<<blocks, 128, 0, st>>>(p); break;
+    }
+    check("gdn_in_proj_fused");
+    return true;
+#else
+    (void) w_qkv; (void) y_qkv; (void) n_qkv; (void) w_z; (void) y_z; (void) n_z; (void) xq; (void) n_in; (void) x;
+    (void) w_alpha; (void) w_beta; (void) dt; (void) ssm_a; (void) gate; (void) beta; (void) h_v; (void) n_tok; (void) stream;
+    return false;
+#endif
 }
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,

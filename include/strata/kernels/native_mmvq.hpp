@@ -97,6 +97,15 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 /// followed by a d plane (n_out x n_in / 32 fp16), the same bytes (34 per 32 values). A registered matrix's
 /// native_q8_0_mmvq calls (keyed by its GGUF-layout device pointer, which stays valid for the prompt path) read the
 /// packed copy instead; every output is bitwise equal to the GGUF-layout kernels.
+/// One matrix of a native_q8_0_mmvq_group launch.
+struct NativeQ8Job {
+    const void* weights;   ///< Q8_0, n_out rows of n_in
+    float* y;              ///< y[j * n_out + row] for column j
+    int n_out;
+};
+/// HIP gfx10+: up to 4 Q8_0 matrices of the same q8_1 input (n_in, ncols columns) in ONE launch, each output bitwise
+/// native_q8_0_mmvq's.  false (nothing launched): another backend, STRATA_MMVQ_Q8W=0, or not this shape.
+bool native_q8_0_mmvq_group(const NativeQ8Job* jobs, int n_jobs, const void* x_q8_1, int n_in, int ncols, void* stream);
 bool native_q8_0_packed_enabled();
 bool native_q8_0_packed_eligible(int n_in, int n_out);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
