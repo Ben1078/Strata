@@ -1562,7 +1562,13 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def park_file(self, action: str, path: str) -> dict:
+        """r8 (q5opt) park files: `PARKSAVE <path>` / `PARKLOAD <path>` (the engine's incremental save and streamed
+        load of one conversation; same protocol as session_file).  -> {"tokens", "bytes" (written / read), "ms",
+        "file_bytes", "mode" ("append" | "full")} for a save, {"tokens", "bytes", "ms"} for a load."""
+        return self.session_file(action, path, park=True)
+
+    def session_file(self, action: str, path: str, park: bool = False) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -1576,14 +1582,15 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        cmd = ("PARKSAVE" if action == "save" else "PARKLOAD") if park else ("SAVE" if action == "save" else "RESTORE")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{cmd} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = ("PARKED" if action == "save" else "UNPARKED") if park else ("SAVED" if action == "save" else "RESTORED")
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -1648,14 +1655,19 @@ class StrataEngine:
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
             if head == want:
                 try:
-                    if len(f) != 4:
+                    if len(f) != (6 if park and action == "save" else 4):
                         raise ValueError
                     tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
                     if not math.isfinite(ms) or ms < 0:
                         raise ValueError
+                    out = {"tokens": tokens, "bytes": size, "ms": ms}
+                    if park and action == "save":
+                        if f[5] not in ("append", "full"):
+                            raise ValueError
+                        out.update(file_bytes=count(f[4]), mode=f[5])
                 except ValueError:
                     raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
+                return out
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
                 continue
@@ -2436,6 +2448,422 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+# ------------------------------------------------------------------------------------------------ disk parking
+import array  # noqa: E402  (r8 disk parking: compact token ids)
+
+
+def _dp_text(content) -> str:
+    """A message's text (a string, or OpenAI/Anthropic content parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) and isinstance(p.get("text"), str) else ""
+                       for p in content)
+    return ""
+
+
+def _dp_prefix_hash(messages, tools) -> str:
+    """A client's prompt-prefix hash: sha256 of JSON.stringify({messages: <leading system/developer messages>,
+    tools}) cut to 12 hex digits (what a proxy in front of the server can log to name a client's prefix).
+    json.dumps with these options matches JSON.stringify for the strings,
+    integers, booleans and nulls clients send (not for integral floats such as 1.0)."""
+    head = []
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            head.append(m)
+        else:
+            break
+    text = json.dumps({"messages": head, "tools": tools if tools is not None else None},
+                      ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _dp_ids(ids) -> "array.array":
+    """Token ids as an int32 array (compact, and slices compare in C)."""
+    return ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)
+
+
+def _dp_lcp(a, b) -> int:
+    """The length of the common start of two token sequences (one compare when one is the start of the other)."""
+    a, b = _dp_ids(a), _dp_ids(b)
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n                                       # a[:lo] == b[:lo]; a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _dp_mem_available() -> int | None:
+    """MemAvailable in bytes (Linux), the figure the engine's RAM floors use; None when unknown."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _dp_arg(args, flag, default):
+    try:
+        return int(args[args.index(flag) + 1]) if flag in args else default
+    except (ValueError, IndexError):
+        return default
+
+
+class DiskPark:
+    """r8 (q5opt): disk parking for ONE conversation (the config's "disk_park").
+
+    The engine keeps one live conversation; its RAM conversation cache (--conversation-cache-mib) cannot hold a very
+    long chat, so every side request (another client) used to cost that chat a full re-read on its next turn.  This
+    policy keeps the chosen conversation ("main") in one session file on disk:
+
+    * park: when the engine's live session is a main-chat state not yet on disk and a request that is NOT a main-chat
+      turn is about to run (a side request, or a fork of the main chat such as an agent's background
+      review turn), the session is SAVEd to `file` first (the same file every time: it is overwritten).  A main-chat
+      request never waits for a save.
+    * restore: when a main-chat request (or a fork) arrives, the live session does not already hold its start, and
+      the file's prompt is the start of this prompt (up to `tail_slack` tokens at its end), the file is RESTOREd first,
+      so only the new tokens are read.  When it no longer matches (the client compressed or edited the chat) the
+      request is served as usual and the file is overwritten at the next park.
+    * a fork (a main-chat request whose user messages contain one of `fork_markers`) may restore the file but never
+      replaces it: its state ends in a question the next real turn does not have.
+
+    Every engine refusal (SERR: RAM, disk, a file from another engine/config) leaves the live session as it was and the
+    request is served normally; the file is dropped when the engine calls it invalid.  Runs under the service FIFO.
+    """
+
+    VERSION = 1
+
+    def __init__(self, cfg: dict, engine_args: list | None = None, mem_available=_dp_mem_available):
+        cfg = dict(cfg or {})
+        args = list(engine_args or [])
+        self.enabled = cfg.get("enabled", True) is not False
+        self.path = os.path.abspath(os.path.expanduser(str(cfg.get("file") or
+                                                          "~/.local/state/strata/main.session")))
+        self.meta_path = self.path + ".json"            # what the file holds: the prompt ids and the facts
+        self.ids_path = self.path + ".ids"              # the prompt ids (int32, native order)
+        m = cfg.get("match") or {}
+        sc = m.get("system_contains") or []
+        self.system_contains = [sc] if isinstance(sc, str) else [str(s) for s in sc]
+        self.min_tools = int(m.get("min_tools") or 0)
+        self.prefix_hashes = {str(h).lower()[:12] for h in (m.get("prefix_hashes") or [])}
+        fm = cfg.get("fork_markers", [])
+        self.fork_markers = [fm] if isinstance(fm, str) else [str(s) for s in fm or []]
+        self.min_tokens = int(cfg.get("min_tokens", 32768))     # shorter chats: the RAM conversation cache is enough
+        self.tail_slack = int(cfg.get("tail_slack", 1024))      # prompt tokens at the end a next turn may change
+        self.min_gain = int(cfg.get("min_gain", 16384))         # restore only when it saves this many tokens
+        # SSD wear: the engine's SAVE rewrites the whole file (~16 KB a token), so a park is skipped while the file
+        # already holds all but `min_new_tokens` of the live chat (the next turn restores the file and reads the
+        # difference), and parks stop for the day once `max_gb_per_day` was written.  A file that no longer covers
+        # the chat (it was compressed) is replaced at once (within the budget).
+        self.min_new_tokens = int(cfg.get("min_new_tokens", 4096 if cfg.get("engine_park") is True else 65536))
+        self.max_bytes_per_day = int(float(cfg.get("max_gb_per_day", 50 if cfg.get("engine_park") is True else 40)) * 1e9)
+        self.wear_path = self.path + ".wear.json"
+        self.wear = {"day": None, "bytes": 0, "saves": 0, "total_bytes": 0, "total_saves": 0}
+        self.ram_margin = int(cfg.get("ram_margin_mib", 512)) << 20
+        floor = cfg.get("ram_floor_mib")                        # default: the engine's own parking floor
+        self.ram_floor = (int(floor) if floor is not None else
+                          _dp_arg(args, "--conversation-cache-min-free-mib", 2560)) << 20
+        self.mem_available = mem_available
+        # r8: the engine's park files (PARKSAVE / PARKLOAD: incremental saves, streamed loads) instead of SAVE /
+        # RESTORE (whole-file rewrites, whole-file reads into RAM).  Needs an engine with park files.
+        self.engine_park = cfg.get("engine_park", False) is True
+        self.live = None        # what the engine's live session holds: {"ids", "kind", "dirty", "gen"} or None
+        self.file = None        # what the file holds: {"ids", "tokens", "bytes", ...} or None
+        self.stats = {"saves": 0, "save_s": 0.0, "restores": 0, "restore_s": 0.0, "restore_skipped_ram": 0,
+                      "refused": 0, "skipped_small": 0, "skipped_budget": 0, "last": None}
+        if self.enabled:
+            self._load_meta()
+            try:
+                self.wear.update(json.loads(Path(self.wear_path).read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                pass
+
+    # -- identification ---------------------------------------------------------------------------------------
+    def classify(self, messages, tools, raw=None) -> str:
+        """"main", "fork" or "side" for a request's messages and tools (as the server parsed them).  `raw`: the
+        request body as it came (an OpenAI body's own "messages" and "tools" give the prefix hash)."""
+        if not self.enabled or not (self.system_contains or self.prefix_hashes):
+            return "side"
+        msgs = [m for m in messages or [] if isinstance(m, dict)]
+        head = []
+        for m in msgs:
+            if m.get("role") in ("system", "developer"):
+                head.append(_dp_text(m.get("content")))
+            else:
+                break
+        system = "\n".join(head)
+        main = bool(self.system_contains) and all(s in system for s in self.system_contains) and \
+            len(tools or []) >= self.min_tools
+        if not main and self.prefix_hashes and isinstance(raw, dict) and isinstance(raw.get("messages"), list):
+            try:
+                main = _dp_prefix_hash(raw["messages"], raw.get("tools")) in self.prefix_hashes
+            except (TypeError, ValueError):
+                main = False
+        if not main:
+            return "side"
+        for m in msgs[len(head):]:
+            if m.get("role") == "user":
+                text = _dp_text(m.get("content")).lstrip()
+                if any(text.startswith(f) for f in self.fork_markers):
+                    return "fork"
+        return "main"
+
+    # -- the file's description ---------------------------------------------------------------------------------
+    def _load_meta(self):
+        try:
+            meta = json.loads(Path(self.meta_path).read_text(encoding="utf-8"))
+            if meta.get("version") != self.VERSION:
+                raise ValueError("another version")
+            st = os.stat(self.path)
+            if st.st_size != meta.get("bytes"):
+                raise ValueError("the session file changed")
+            ids = array.array("i")
+            with open(self.ids_path, "rb") as f:
+                ids.frombytes(f.read())
+            if len(ids) != meta.get("prompt_tokens") or \
+                    hashlib.sha256(ids.tobytes()).hexdigest() != meta.get("ids_sha256"):
+                raise ValueError("the prompt ids do not match")
+            self.file = {**meta, "ids": ids}
+            print(f"[strata] disk park: {self.path} holds {meta.get('tokens')} tokens of the main chat "
+                  f"({meta.get('bytes', 0) / 1e9:.2f} GB, saved {meta.get('saved_at')})", flush=True)
+        except FileNotFoundError:
+            self.file = None
+        except (OSError, ValueError, TypeError) as e:
+            print(f"[strata] disk park: ignoring {self.path} ({e})", flush=True)
+            self.file = None
+
+    def _write_meta(self, ids, r: dict, save_s: float):
+        arr = _dp_ids(ids)
+        raw = arr.tobytes()
+        meta = {"version": self.VERSION, "tokens": r["tokens"], "bytes": r["bytes"], "prompt_tokens": len(arr),
+                "ids_sha256": hashlib.sha256(raw).hexdigest(), "save_ms": r.get("ms"),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        for path, data in ((self.ids_path, raw), (self.meta_path, json.dumps(meta).encode())):
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        self.file = {**meta, "ids": arr}
+
+    def _drop_file(self, why: str):
+        """The file can no longer be trusted (or the engine refused it): forget it; the next park writes it again."""
+        if self.file is not None or os.path.exists(self.meta_path):
+            print(f"[strata] disk park: dropping {self.path} ({why})", flush=True)
+        self.file = None
+        for p in (self.meta_path, self.ids_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # -- the policy ---------------------------------------------------------------------------------------------
+    def _covers(self, held, ids) -> bool:
+        """`held` (a prompt the engine resumes from up to its end, minus the tail) is the start of `ids`."""
+        if held is None or len(held) == 0:
+            return False
+        need = max(1, len(held) - self.tail_slack)
+        return len(ids) > need and _dp_lcp(held, ids[:len(held)]) >= need
+
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
+    def park_veto(self, live_ids) -> str | None:
+        """Why the live main chat is NOT saved now (SSD wear), or None to save it."""
+        f = self.file
+        covered = f is not None and self._covers(f["ids"], live_ids)
+        if covered and len(live_ids) - len(f["ids"]) < self.min_new_tokens:
+            self.stats["skipped_small"] += 1
+            return (f"the file already holds all but {len(live_ids) - len(f['ids'])} tokens of it "
+                    f"(min_new_tokens {self.min_new_tokens})")
+        per_token = (f["bytes"] / max(1, f["tokens"])) if f else 16500.0
+        est = int(per_token * len(live_ids)) + (240 << 20)
+        if self.engine_park and covered:              # an append: the new tokens, the running state, a manifest
+            est = int(per_token * max(0, len(live_ids) - len(f["ids"]))) + (240 << 20)
+        used = self.wear["bytes"] if self.wear.get("day") == self._today() else 0
+        if used + est > self.max_bytes_per_day:
+            self.stats["skipped_budget"] += 1
+            return (f"today's write budget: {used / 1e9:.1f} GB written, ~{est / 1e9:.1f} GB more would pass "
+                    f"max_gb_per_day {self.max_bytes_per_day / 1e9:.0f}")
+        return None
+
+    def _note_written(self, nbytes: int):
+        w, day = self.wear, self._today()
+        if w.get("day") != day:
+            w.update(day=day, bytes=0, saves=0)
+        w["bytes"] += nbytes
+        w["saves"] += 1
+        w["total_bytes"] = w.get("total_bytes", 0) + nbytes
+        w["total_saves"] = w.get("total_saves", 0) + 1
+        try:
+            tmp = self.wear_path + ".tmp"
+            Path(tmp).write_text(json.dumps(w), encoding="utf-8")
+            os.replace(tmp, self.wear_path)
+        except OSError:
+            pass
+
+    def restore_need(self) -> int:
+        """RAM the engine's RESTORE asks above its floor (session_read_peak_bytes): the file, a 16 MiB read buffer,
+        a page per 16 MiB segment and 1 MiB.  A park load (engine_park) streams the K/V: the running state (~0.2 GB),
+        the manifest and the 16 MiB buffer."""
+        if self.engine_park:
+            return (384 << 20) + len((self.file or {}).get("ids") or ()) * 8
+        b = int((self.file or {}).get("bytes") or 0)
+        return b + (16 << 20) + (b // (16 << 20) + 1) * 4096 + (1 << 20)
+
+    def before(self, engine, ids, kind: str, set_phase=None) -> dict:
+        """Under the FIFO, the engine idle and loaded, before `ids` is sent.  -> what was done (for the log/metrics).
+        Never raises for a refused file; EngineDied (the engine ended during a session command) propagates after
+        the state is forgotten, so the caller can start it again."""
+        out = {"kind": kind}
+        if not self.enabled or kind == "off" or getattr(engine, "batch", 0) or not hasattr(engine, "session_file"):
+            self.stats["last"] = out
+            return out
+        gen = (getattr(engine, "gen", None), id(getattr(engine, "proc", None)))
+        if self.live is not None and self.live.get("gen") != gen:
+            self.live = None                            # another engine process: its live session is gone
+        live = self.live
+        # 1) park: the live main-chat state goes to disk before anything else replaces it
+        why_not = None
+        if live and live["kind"] == "main" and live["dirty"] and kind != "main":
+            why_not = self.park_veto(live["ids"])
+            if why_not:
+                out["save"] = f"skipped: {why_not}"
+                print(f"[strata] disk park: not saving the main chat ({len(live['ids'])} tokens): {why_not}",
+                      flush=True)
+        if live and live["kind"] == "main" and live["dirty"] and kind != "main" and not why_not:
+            if set_phase:
+                set_phase("parking the main chat to disk")
+            t0 = time.monotonic()
+            try:
+                r = engine.park_file("save", self.path) if self.engine_park else engine.session_file("save", self.path)
+            except SessionRefused as e:
+                self.stats["refused"] += 1
+                if e.published:                         # the new file replaced the old one: it is the new state
+                    self._drop_file(f"save published but failed: {e}")
+                print(f"[strata] disk park: save refused ({e.kind}): {e}", flush=True)
+                out["save"] = f"refused: {e.kind}"
+            except EngineDied:
+                self.live = None
+                self._drop_file("the engine ended during a save")
+                raise
+            else:
+                s = time.monotonic() - t0
+                live["dirty"] = False
+                self._note_written(r["bytes"])           # PARKED: bytes written; SAVED: the whole file
+                held = live["ids"]
+                if self.engine_park and r["tokens"] <= len(held):
+                    held = held[:r["tokens"]]           # the engine kept the deepest checkpoint: this start of it
+                if self.engine_park:
+                    r = {**r, "written": r["bytes"], "bytes": r.get("file_bytes", r["bytes"])}
+                try:
+                    self._write_meta(held, r, s)
+                except OSError as e:
+                    self._drop_file(f"cannot write its description: {e}")
+                self.stats["saves"] += 1
+                self.stats["save_s"] += s
+                out["save"] = {"tokens": r["tokens"], "bytes": r["bytes"], "s": round(s, 2),
+                               "written": r.get("written", r["bytes"]), "mode": r.get("mode", "full")}
+                print(f"[strata] disk park: saved the main chat ({r['tokens']} tokens, file {r['bytes'] / 1e9:.2f} GB, "
+                      f"{r.get('written', r['bytes']) / 1e9:.3f} GB written, {r.get('mode', 'full')}) in {s:.2f} s "
+                      f"before a {kind} request", flush=True)
+        # 2) restore: a main-chat turn (or a fork) whose start the file holds and the live session does not
+        f = self.file
+        if kind in ("main", "fork") and f is not None and len(f["ids"]) >= self.min_tokens and \
+                self._covers(f["ids"], ids):
+            have = len(live["ids"]) if live and live["kind"] in ("main", "fork") and \
+                self._covers(live["ids"], ids) else 0
+            if len(f["ids"]) - have >= self.min_gain:
+                avail = self.mem_available()
+                need = self.restore_need() + self.ram_floor + self.ram_margin
+                if avail is not None and avail < need:
+                    self.stats["restore_skipped_ram"] += 1
+                    out["restore"] = "skipped: RAM"
+                    print(f"[strata] disk park: restore skipped: {avail >> 20} MiB available, {need >> 20} MiB "
+                          f"needed (file {f['bytes'] >> 20} MiB + floor {self.ram_floor >> 20} + margin "
+                          f"{self.ram_margin >> 20}); reading the prompt", flush=True)
+                    self.stats["last"] = out
+                    return out
+                if set_phase:
+                    set_phase("restoring the main chat from disk")
+                t0 = time.monotonic()
+                try:
+                    r = engine.park_file("restore", self.path) if self.engine_park else \
+                        engine.session_file("restore", self.path)
+                except SessionRefused as e:
+                    self.stats["refused"] += 1
+                    out["restore"] = f"refused: {e.kind}"
+                    print(f"[strata] disk park: restore refused ({e.kind}): {e}; reading the prompt", flush=True)
+                    if e.kind != "memory":
+                        self._drop_file(f"the engine refused it: {e.kind}")
+                except EngineDied:
+                    self.live = None                    # a transfer failure ends the engine (FATAL)
+                    self._drop_file("the engine ended during a restore")
+                    raise
+                else:
+                    s = time.monotonic() - t0
+                    self.live = {"ids": f["ids"], "kind": "main", "dirty": False, "gen": gen}
+                    self.stats["restores"] += 1
+                    self.stats["restore_s"] += s
+                    out["restore"] = {"tokens": r["tokens"], "bytes": r["bytes"], "s": round(s, 2),
+                                      "expect": len(f["ids"]) - self.tail_slack}
+                    print(f"[strata] disk park: restored the main chat ({r['tokens']} tokens, "
+                          f"{r['bytes'] / 1e9:.2f} GB) in {s:.2f} s for a {kind} request", flush=True)
+        self.stats["last"] = out
+        return out
+
+    def after(self, engine, ids, kind: str, done: dict | None, passes: int, finish: str, info: dict | None = None):
+        """Under the FIFO, after the request: what the engine's live session holds now.  `done` is the request's last
+        DONE figures (None: none came - the engine died or the request never ran)."""
+        if not self.enabled:
+            return
+        gen = (getattr(engine, "gen", None), id(getattr(engine, "proc", None)))
+        alive = getattr(engine, "alive", lambda: True)()
+        partial = done is not None and done.get("finish") == "cancel" and done.get("prompt_read") is not None and \
+            int(done.get("reused") or 0) + int(done["prompt_read"]) < len(ids)
+        if not alive or done is None or finish == "error" or partial or passes != 1 or kind == "off":
+            # unknown, a prompt read cut short, or a continuation pass whose deepest checkpoint is not this prompt's
+            # end: never parked (the file keeps the older state, which the next turn can still use)
+            self.live = None
+            return
+        r = (info or {}).get("restore")
+        if isinstance(r, dict) and done.get("reused") is not None and done["reused"] < r["expect"] // 2:
+            print(f"[strata] disk park: the restored state gave back only {done['reused']} of ~{r['expect']} "
+                  "tokens; dropping the file", flush=True)
+            self._drop_file("it did not match the next turn")
+        if kind in ("main", "fork"):
+            held = _dp_ids(ids)
+            self.live = {"ids": held, "kind": kind, "dirty": kind == "main" and len(held) >= self.min_tokens,
+                         "gen": gen}
+        else:
+            self.live = {"ids": None, "kind": "side", "dirty": False, "gen": gen}
+
+    def forget_live(self):
+        """Something else changed the engine's session (a /slots restore): its live state is unknown."""
+        self.live = None
+
+    def view(self) -> dict:
+        f = self.file
+        return {"enabled": self.enabled, "file": self.path,
+                "file_tokens": f.get("tokens") if f else None, "file_bytes": f.get("bytes") if f else None,
+                "file_saved_at": f.get("saved_at") if f else None,
+                "written_today_bytes": self.wear["bytes"] if self.wear.get("day") == self._today() else 0,
+                "written_total_bytes": self.wear.get("total_bytes", 0),
+                "live": None if self.live is None else {"kind": self.live["kind"], "dirty": self.live["dirty"],
+                                                        "tokens": len(self.live["ids"]) if self.live["ids"] is not None
+                                                        else None},
+                **{k: (round(v, 2) if isinstance(v, float) else v) for k, v in self.stats.items()}}
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -2451,6 +2879,8 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
+        self.disk_park = None                         # r8 (q5opt): the config's "disk_park" (DiskPark) or None
+        self.dp_tag = threading.local()               # r8: prepare()'s classification of this thread's request
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -2553,6 +2983,8 @@ class Service:
                                        else "restoring a session", started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
+                    if action == "restore" and self.disk_park is not None:
+                        self.disk_park.forget_live()     # r8: the live session is no longer what disk parking saw
                     r = self.engine.session_file(action, path)
                 except SessionRefused as e:
                     body = error(e.status, str(e))
@@ -3031,6 +3463,7 @@ class Service:
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                **({"disk_park": self.disk_park.view()} if self.disk_park is not None else {}),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -3227,6 +3660,16 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+        self.dp_tag.value = None
+        if self.disk_park is not None and self.disk_park.enabled:   # r8: is this the parked conversation?
+            try:
+                # "strata_disk_park": false - this request neither parks nor brings back the parked chat (tests: the
+                # RAM conversation cache's path for the same turn)
+                kind = "off" if isinstance(req, dict) and req.get("strata_disk_park") is False else \
+                    self.disk_park.classify(messages, tools, raw=req)
+                self.dp_tag.value = (kind, ids)
+            except Exception as e:                      # never a reason to refuse a request
+                print(f"[strata] disk park: cannot classify the request: {e!r}", flush=True)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
@@ -3403,6 +3846,13 @@ class Service:
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
+        dp, dp_kind, dp_info = (self.disk_park if not par else None), None, None   # r8: disk parking
+        if dp is not None:
+            tag = getattr(self.dp_tag, "value", None)
+            self.dp_tag.value = None
+            dp_kind = "side"
+            if tag is not None and (tag[1] is ids or (len(ids) >= len(tag[1]) and ids[:len(tag[1])] == tag[1])):
+                dp_kind = tag[0]
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -3427,6 +3877,20 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
+                    if dp is not None and dp.enabled:   # r8: park the main chat / bring it back, under the fifo
+                        def dp_phase(p):
+                            with self.status_lock:
+                                st["phase"] = p
+                        try:
+                            dp_info = dp.before(self.engine, ids, dp_kind, dp_phase)
+                        except EngineDied as e:
+                            print(f"[strata] disk park: {e}; starting the engine again", flush=True)
+                            self.ensure_loaded()
+                        except Exception as e:          # the policy never fails a request
+                            print(f"[strata] disk park: error before the request: {e!r}", flush=True)
+                            dp.live = None
+                        with self.status_lock:
+                            st["phase"] = "reading the prompt"
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -3611,6 +4075,13 @@ class Service:
                     finish = "disconnect"
                     raise
                 finally:
+                    if dp is not None and dp_kind is not None:   # r8: what the engine's live session holds now
+                        try:
+                            dp.after(self.engine, ids, dp_kind, segments[0] if segments else None, len(segments),
+                                     finish, dp_info)
+                        except Exception as e:
+                            print(f"[strata] disk park: error after the request: {e!r}", flush=True)
+                            dp.live = None
                     # #266: settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
@@ -5665,6 +6136,29 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    # r8 (q5opt): "disk_park": {"file": ..., "match": {"system_contains": [...]}, ...} - one conversation kept in a
+    # session file on disk between its turns (DiskPark)
+    dpc = cfg.get("disk_park")
+    if a.engine == "strata" and isinstance(dpc, dict) and dpc.get("enabled", True) is not False:
+        try:
+            svc.disk_park = DiskPark(dpc, list(getattr(engine, "spawn", (None, cfg.get("args") or []))[1] or []))
+            os.makedirs(os.path.dirname(svc.disk_park.path), mode=0o700, exist_ok=True)
+        except (ValueError, TypeError, OSError) as e:
+            raise SystemExit(f"[strata] config disk_park: {e}")
+        if svc.disk_park.engine_park:               # an engine without PARKSAVE would answer ERR: the engine ends
+            try:
+                has = b"PARKSAVE " in Path(getattr(engine, "spawn", (cfg.get("exe"),))[0]).read_bytes()
+            except OSError:
+                has = False
+            if not has:
+                print("[strata] disk park OFF: \"engine_park\" is set but this engine has no park files "
+                      "(PARKSAVE/PARKLOAD)", flush=True)
+                svc.disk_park.enabled = False
+        print(f"[strata] disk park on: {svc.disk_park.path} for requests whose system prompt has "
+              f"{svc.disk_park.system_contains}" + (f" or prefix hash {sorted(svc.disk_park.prefix_hashes)}"
+                                                    if svc.disk_park.prefix_hashes else "") +
+              f" (at least {svc.disk_park.min_tokens} tokens; RAM floor {svc.disk_park.ram_floor >> 20} MiB)",
+              flush=True)
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):
