@@ -81,6 +81,23 @@ public:
     static double pinned_share();
     /// The chunk size from which a chunk streams every expert the GPU does not hold (1024; STRATA_PREFILL_STREAM_MIN).
     static int64_t stream_all_min_tokens();
+    /// r6-pf: runtime overrides of the prompt-path knobs (the serve loop re-reads STRATA_PF_TUNE per request; call
+    /// between prompts).  cpu_share: < -1.5 = STRATA_PREFILL_CPU_SHARE's, -1 = auto, 0 = off, else that share;
+    /// cpu_maxt: 0 = STRATA_PREFILL_CPU_MAXT's (default 8, kernels::cpu::MAXT) - the most tokens an expert may have to
+    /// go to the CPU (more than 8 run as several 8-token jobs: each token's row is the same bits); stream_min: 0 =
+    /// STRATA_PREFILL_STREAM_MIN's (1024), the chunk from which every non-resident expert streams.
+    static void set_tune(double cpu_share, int cpu_maxt, int64_t stream_min);
+    /// r6-pf: the KV-streaming staging pool sized for `cells` cells (0 = --max-context's, the default) - what
+    /// bytes_needed / relayout lay out from now on; a request sets it to the cells it reaches.  stage_current(): this
+    /// layout was carved with the current value (else relayout before running).
+    static void set_stage_cells(int64_t cells);
+    /// r6-pf: STRATA_PF_GROUP_LOCAL at runtime (-1 = the env's): the host grouping on cached copies of the mapped tables
+    static void set_group_local(int on);
+    /// r6-pf: STRATA_PREFILL_CPU_STATIC at runtime (< -1.5 = the env's, -1 = auto, 0 = off, x = the coldest share)
+    static void set_cpu_static(double frac);
+    /// r6-pf: 0 = the CPU share's threads keep the host's inherited CPU pin (A/B); -1/1 = they move to CPUs 8-15
+    static void set_pf_helper(int on);
+    bool stage_current() const;
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);

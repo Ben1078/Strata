@@ -56,6 +56,9 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#if defined(STRATA_NATIVE_EXPERTS)
+#include "strata/kernels/cpu/native_expert.hpp"
+#endif
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -9068,7 +9071,28 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            // r6-pf (opt-in STRATA_PARK_SKIP_TAIL=N): the next turn of the conversation the session holds - it resumes
+            // from that conversation's own checkpoint (not from the cache, not a slot) and the outgoing branch has at
+            // most N tokens past it (the last reply, the last effort/reminder tail) - does not park the whole
+            // conversation first: that copy (~0.2-0.65 s at 100K tokens, inside the turn's time to first token) only
+            // keeps the old reply, which the client has just replaced.  Its checkpoints stay; a retry re-reads <= N.
+            static const int64_t park_skip_tail = [] {
+                const char* e = std::getenv("STRATA_PARK_SKIP_TAIL");
+                return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 0;
+            }();
+            bool rewind_turn = false;
+            if (park_skip_tail > 0 && !from_live && !incoming && slot_source < 0 && live_ok && resume > 0 &&
+                (int64_t) live.size() >= resume && (int64_t) live.size() - resume <= park_skip_tail) {
+                rewind_turn = true;
+                for (int64_t i = 0; rewind_turn && i < resume; ++i)
+                    rewind_turn = (int64_t) live[(size_t) i] == (int64_t) ids[(size_t) i];
+                if (rewind_turn)
+                    std::fprintf(stderr, "strata serve: conversation cache: not parked (STRATA_PARK_SKIP_TAIL: the turn "
+                                         "rewinds %lld of %zu tokens)\n", (long long) ((int64_t) live.size() - resume),
+                                 live.size());
+            }
+            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !rewind_turn &&
+                !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -9270,7 +9294,16 @@ int main(int argc, char** argv) {
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+            // r6-pf (STRATA_PF_TUNE cut_tail=N, testing): the prompt's last N tokens are read through the verify windows
+            // as a part of their own (STRATA_LOGPOS then logs them, conditioned on what the prompt path read before)
+            int64_t req_cut_tail = 0;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
+                if (req_cut_tail > 0 && !no_short && a >= n - 1 - req_cut_tail) {
+                    if (sp.embd_rows != nullptr)
+                        for (int64_t i = a; i < b; ++i)
+                            if (sp.embd_rows[i] != nullptr) return false;
+                    return true;
+                }
                 if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
@@ -9302,6 +9335,56 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline switch: pw=%d theta=%.3f force_miss=%d short_read=%lld\n", pl_pw,
                                  pl_theta, pl_force_miss, (long long) req_short_read);
                 }
+            }
+            // r6-pf: STRATA_PF_TUNE=<file> - the prompt path's knobs re-read at every request, so one engine A/Bs them
+            // on the same expert placement and context: "cpu_share=<x|auto|env> cpu_maxt=<n> stream_min=<n>
+            // short_read=<n>" (a missing key keeps the default).  Unset: nothing here runs.
+            // r6-pf: STRATA_PF_STAGE_FIT=1 (the tune file's stage_fit= overrides it): the KV-streaming staging pool the
+            // prompt path borrows is sized for this prompt's cells (rounded up to 16K) instead of --max-context's
+            static const bool stage_fit_env = [] { const char* e = std::getenv("STRATA_PF_STAGE_FIT"); return e && e[0] == '1'; }();
+            if (stage_fit_env) strata::prefill::Prefill::set_stage_cells(((n + 1024 + 16383) / 16384) * 16384);
+            if (static const char* tf = std::getenv("STRATA_PF_TUNE"); tf != nullptr) {
+                double cs = -2.0;
+                int mt = 0, kq = -1, sfit = stage_fit_env ? 1 : 0, gloc = -1, phelp = -1;
+                double cst = -2.0;
+                long long sm = 0, srd = -1;
+                char buf[512] = {};
+                if (std::FILE* f = std::fopen(tf, "r")) {
+                    const size_t nr = std::fread(buf, 1, sizeof buf - 1, f);
+                    std::fclose(f);
+                    buf[nr] = 0;
+                    if (const char* q = std::strstr(buf, "cpu_share=")) {
+                        if (std::strncmp(q + 10, "auto", 4) == 0) cs = -1.0;
+                        else if (std::strncmp(q + 10, "env", 3) == 0) cs = -2.0;
+                        else cs = std::clamp(std::atof(q + 10), 0.0, 1.0);
+                    }
+                    if (const char* q = std::strstr(buf, "cpu_maxt=")) mt = std::max(0, std::atoi(q + 9));
+                    if (const char* q = std::strstr(buf, "stream_min=")) sm = std::max(0LL, std::atoll(q + 11));
+                    if (const char* q = std::strstr(buf, "short_read=")) srd = std::max(0LL, std::atoll(q + 11));
+                    if (const char* q = std::strstr(buf, "kq512=")) kq = std::atoi(q + 6) != 0 ? 1 : 0;
+                    if (const char* q = std::strstr(buf, "stage_fit=")) sfit = std::atoi(q + 10) != 0 ? 1 : 0;
+                    if (const char* q = std::strstr(buf, "group_local=")) gloc = std::atoi(q + 12) != 0 ? 1 : 0;
+                    if (const char* q = std::strstr(buf, "pf_helper=")) phelp = std::atoi(q + 10) != 0 ? 1 : 0;
+                    if (const char* q = std::strstr(buf, "cpu_static=")) {
+                        if (std::strncmp(q + 11, "auto", 4) == 0) cst = -1.0;
+                        else cst = std::clamp(std::atof(q + 11), 0.0, 0.95);
+                    }
+                    if (const char* q = std::strstr(buf, "cut_tail=")) req_cut_tail = std::max(0LL, std::atoll(q + 9));
+                }
+                strata::prefill::Prefill::set_group_local(gloc);
+                strata::prefill::Prefill::set_pf_helper(phelp);
+                strata::prefill::Prefill::set_cpu_static(cst);
+                // stage_fit=1: the KV staging pool for this prompt's cells, rounded up to 16K (0 = --max-context's)
+                strata::prefill::Prefill::set_stage_cells(sfit ? ((n + 1024 + 16383) / 16384) * 16384 : 0);
+                strata::prefill::Prefill::set_tune(cs, mt, (int64_t) sm);
+#if defined(STRATA_NATIVE_EXPERTS)
+                strata::kernels::cpu::set_kq512_gu(kq);
+#endif
+                if (srd >= 0) req_short_read = srd;
+                std::fprintf(stderr, "strata pf tune: cpu_share %.2f cpu_maxt %d stream_min %lld short_read %lld kq512 %d "
+                                     "stage_fit %d group_local %d\n", cs, mt,
+                             (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) req_short_read, kq,
+                             sfit, gloc);
             }
             // --pipeline-windows: tokens [a, b) through the windows with the stages overlapped.  The tokens are known,
             // so every window commits whole: stage 0 queues window K, its commit and window K+1 back to back (each
@@ -9535,7 +9618,7 @@ int main(int argc, char** argv) {
                     }
                     const strata::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
-                    if (want != p.sp->chunk() || first != p.first_now) {
+                    if (want != p.sp->chunk() || first != p.first_now || !p.sp->stage_current()) {
                         if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
@@ -9748,15 +9831,28 @@ int main(int argc, char** argv) {
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
+            if (req_cut_tail > 0 && n - 1 - req_cut_tail > read_from) {   // r6-pf cut_tail=N (testing)
+                cuts.push_back(n - 1 - req_cut_tail);
+                std::sort(cuts.begin(), cuts.end());
+            }
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
+            // r6-pf: STRATA_PF_TURN_TIMING=1 - one line per request: where the prompt time went (lend, batched parts,
+            // window parts, refills, checkpoints), the slots lent and the prompt path's expert counts
+            static const bool pf_tt = std::getenv("STRATA_PF_TURN_TIMING") != nullptr;
+            auto tt_ms = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+            const double tt_pre = tt_ms(r0);
+            double tt_lend = 0, tt_batched = 0, tt_windows = 0, tt_refill = 0, tt_ckpt = 0;
+            int64_t tt_nb = 0, tt_nw = 0, tt_parts = 0, tt_lent = 0;
+            const strata::prefill::PrefillStats tt_s0 = sp.stats();
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                const auto tpre = Clock::now();
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -9765,8 +9861,19 @@ int main(int argc, char** argv) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
+                if (pf_tt) {
+                    (win ? tt_refill : tt_lend) += tt_ms(tpre);
+                    int64_t nl = 0;
+                    for (const PfPart& p : pf_parts) nl += (int64_t) p.lent.size();
+                    tt_lent = std::max(tt_lent, nl);
+                }
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
+                if (pf_tt) {
+                    (win ? tt_windows : tt_batched) += tt_ms(tsp);
+                    (win ? tt_nw : tt_nb) += to - at;
+                    if (!win) ++tt_parts;
+                }
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -9790,21 +9897,41 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                const auto tck = Clock::now();
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
+                if (pf_tt) tt_ckpt += tt_ms(tck);
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+            const auto trf = Clock::now();
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
+            if (pf_tt) {
+                tt_refill += tt_ms(trf);
+                const strata::prefill::PrefillStats& s1 = sp.stats();
+                std::fprintf(stderr, "strata pf turn: %lld reused + %lld read (%lld batched in %lld parts, %lld windows), %lld "
+                                     "lent: before %.1f ms, lend %.1f, batched %.1f, windows %.1f, refill %.1f, checkpoints %.1f, "
+                                     "total %.1f ms; experts streamed %lld (dma %lld), resident %lld, cpu %lld (share %.2f), "
+                                     "host staging %.1f ms\n",
+                             (long long) resume, (long long) (n - 1 - read_from), (long long) tt_nb, (long long) tt_parts,
+                             (long long) tt_nw, (long long) tt_lent, tt_pre, tt_lend, tt_batched, tt_windows, tt_refill, tt_ckpt,
+                             tt_ms(r0), (long long) (s1.experts_streamed - tt_s0.experts_streamed),
+                             (long long) (s1.experts_dma - tt_s0.experts_dma),
+                             (long long) (s1.experts_resident - tt_s0.experts_resident),
+                             (long long) (s1.experts_cpu - tt_s0.experts_cpu), s1.cpu_share,
+                             s1.ms_experts_host - tt_s0.ms_experts_host);
+            }
+            if (stage_fit_env || std::getenv("STRATA_PF_TUNE") != nullptr)
+                strata::prefill::Prefill::set_stage_cells(0);   // r6-pf: no sticky small staging pool after the request
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "

@@ -6,9 +6,12 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
+
+#include <atomic>
 #include "ggml-cpu.h"
 
 #include <cmath>
@@ -73,6 +76,21 @@ namespace {
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
 // iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or STRATA_FORCE_ISA=avx, keeps ggml's).  STRATA_NO_Q8K_AVX2=1:
 // ggml's on any CPU.
+// r6-pf (opt-in STRATA_KQ512=1): q5opt round 3's AVX-512 Q5_K rows (kq_avx512.cpp, bit-exact against ggml-cpu's
+// __AVX2__ vec_dot for any token count, kq512_parity) for gate/up groups of 2+ tokens - 1.4-2.0x one thread at 2-4
+// tokens, the prompt path's CPU share hands the pool 2-8-token groups (Q5_K 2.2x at 8 tokens in this build).  One-token
+// groups stay on ggml; the Q8_0 down rows take kq512 from 3 tokens (native_down_rows).
+std::atomic<int> g_kq512_tune{-1};
+bool kq512_gu_on() {
+#if defined(STRATA_ISA_FLOOR_AVX) || defined(STRATA_ISA_FLOOR_NONE)
+    return false;
+#else
+    static const bool avx512 = cpu_avx512_ok();
+    static const bool on = avx512 && [] { const char* e = std::getenv("STRATA_KQ512"); return e != nullptr && std::atoi(e) != 0; }();
+    const int t = g_kq512_tune.load(std::memory_order_relaxed);
+    return t < 0 ? on : (t > 0 && avx512);
+#endif
+}
 bool q8k_avx2(int type) {
     static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
@@ -88,6 +106,8 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
+
+void set_kq512_gu(int on) { g_kq512_tune.store(on < 0 ? -1 : on > 0 ? 1 : 0, std::memory_order_relaxed); }
 
 int native_gu_mt_min(int gu_type) {
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
@@ -128,6 +148,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
+    if (nt >= 2 && kq512_gu_on() && kq512_supported(f.gu_type)) {   // r6-pf: STRATA_KQ512=1 (bit-exact)
+        kq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
     if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -171,6 +195,12 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    // r6-pf (STRATA_KQ512=1): Q8_0 down rows on the AVX-512 kernel from 3 tokens (bit-exact; measured in this build, one
+    // thread from DRAM: 1.07x at 3, 1.10x at 4, 1.26x at 8 tokens; 0.95-1.0x below 3)
+    if (nt >= 3 && f.d_type == 8 && kq512_gu_on()) {
+        kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
