@@ -2358,6 +2358,7 @@ bool FileExpertSource::pin_cache_complement(
     }
 #endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
+    uint64_t lend_cap = std::numeric_limits<uint64_t>::max();     // q5opt r6-mem STRATA_RESIDENT_LEND: the budget
     uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
     uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
     if (budget_bytes > 0) {
@@ -2409,9 +2410,27 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files\n",
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
+        // q5opt r6-mem, STRATA_RESIDENT_LEND=1 (default off): when the budget holds EVERY expert the GPU cache does not,
+        // what is left of it keeps the prompt path's lend region in RAM too - from the cache's last slot down, as the
+        // mode without a budget does - so a prompt streams its lent experts and refills their slots from the RAM copy
+        // (by DMA) instead of from the model files.  The budget stays the cap: --resident-budget-gib 84.5 holds the
+        // whole 1558-slot loan of an 8192-token chunk at 1M context (78.34 + 5.81 GiB).  The bytes are the same bytes.
+        static const bool lend_env = [] { const char* v = std::getenv("STRATA_RESIDENT_LEND"); return v != nullptr && std::atoi(v) != 0; }();
+        int64_t n_comp = 0;
+        for (uint64_t o : offsets) n_comp += o != kNoComplement ? 1 : 0;
+        if (lend_env && lend_from_slot >= 0 && held == n_comp && additional_gpu_pairs.empty()) {
+            lend_cap = budget_bytes;
+            std::fprintf(stderr, "FileExpertSource: STRATA_RESIDENT_LEND=1: every expert outside the GPU cache fits; the "
+                                 "remaining %.2f GiB of the budget keep lend-region experts in RAM too\n",
+                         (double) (budget_bytes - at) / 1073741824.0);
+        } else {
+            if (lend_env)
+                std::fprintf(stderr, "FileExpertSource: STRATA_RESIDENT_LEND=1 ignored: the budget does not hold every "
+                                     "expert outside the GPU cache (%lld of %lld)\n", (long long) held, (long long) n_comp);
+            lend_from_slot = -1;
+        }
         offsets.swap(ranked);
         bytes = at;
-        lend_from_slot = -1;
     }
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
@@ -2443,7 +2462,7 @@ bool FileExpertSource::pin_cache_complement(
     // only the last few).  The rest keep the mapped-file fallback.
     int64_t keep_from = n_slots;
     if (lend) {
-        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, std::min(budget, lend_cap), lend_from_slot);
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
