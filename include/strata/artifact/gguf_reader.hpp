@@ -455,6 +455,9 @@ private:
             if (a->u) align = a->u;
         alignment_ = align;
         data_start_ = (c.pos() + align - 1) / align * align;
+        // A metadata-only shard (no tensors) may end without the alignment padding: Unsloth's UD-Q5_K_XL shard 1 is
+        // 6 bytes short of the next boundary, where its UD-Q4/Q6 shard 1 is padded. Its data section is empty either way.
+        if (tensors_.empty() && data_start_ > size_ && data_start_ - size_ < align) data_start_ = size_;
         if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
     }
 
