@@ -2270,6 +2270,18 @@ bool FileExpertSource::pin_cache_complement(
                     device = (const uint8_t*) alias;
                     pinned_ok = true;
                     note = "page-locked and mapped";
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+                    // ROCm's mapped host allocation is anonymous memory the GPU reaches through HMM (a KFD userptr),
+                    // not pinned pages: under pressure the kernel swaps it out (eagerly with zram's swappiness > 100),
+                    // and every invalidation stops the GPU's queues while amdgpu's restore_userptr worker re-walks the
+                    // whole range - allocation failures in that worker and a verify timeout (#267) on a 96 GB host
+                    // with a 75 GiB complement. mlock keeps it resident, as cudaHostAlloc's pages are on CUDA.
+                    {
+                        const strata::platform::LockResult lr = strata::platform::lock_resident(arena, bytes);
+                        if (lr.ok) { locked = lr.locked_bytes; lock_off = 0; }
+                        note += lr.ok ? std::string("; mlock'd (ROCm maps it without pinning)") : "; " + lr.note;
+                    }
+#endif
                 } else {
                     note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
                     (void) cudaGetLastError();
@@ -2417,6 +2429,12 @@ bool FileExpertSource::pin_cache_complement(
                 }
                 if (!paced) lock_off = partial_pin;
                 // (paced: lock_off was set above)
+#if defined(STRATA_USE_HIP) && defined(__linux__)
+                // ROCm's cudaHostRegister maps the prefix for the GPU without pinning it (a KFD userptr): under
+                // pressure the kernel swaps it out and the GPU stalls on every re-validation. mlock the whole arena,
+                // registered prefix included (the same reason the cudaHostAlloc'd arena above is mlock'd).
+                lock_off = 0;
+#endif
                 const strata::platform::LockResult lr =
                     lock_off < bytes ? strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off)
                                      : strata::platform::LockResult{true, 0, ""};
