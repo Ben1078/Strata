@@ -43,6 +43,14 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+/// r6-pf in-pass checkpoint: the running state a run copied out at its snapshot position (Prefill::snapshot).
+struct PrefillSnapshot {
+    const uint8_t* gdn = nullptr; size_t gdn_bytes = 0;          ///< gdn_alloc rows: recurrence state + conv history
+    const uint8_t* ple = nullptr; size_t ple_bytes = 0;          ///< NG_HIST x NG_HC_DIM normalized history (or 0)
+    const uint8_t* qsa = nullptr; size_t tail_bytes = 0, dead_bytes = 0, qsa_stride = 0;   ///< per global QSA ordinal
+};
+}
+namespace strata::prefill {
 
 class Prefill {
 public:
@@ -95,6 +103,12 @@ public:
     static void set_group_local(int on);
     /// r6-pf: STRATA_PREFILL_CPU_STATIC at runtime (< -1.5 = the env's, -1 = auto, 0 = off, x = the coldest share)
     static void set_cpu_static(double frac);
+    /// r6-pf in-pass checkpoint: the next run() copies the running state as it stands once the tokens below absolute
+    /// position `pos` are read (GDN recurrence + conv, PLE history, every QSA layer's indexer tail / dead / block
+    /// position) into page-locked host memory - its stateful kernels split there, which leaves the bits of two runs
+    /// split there.  -1 = none.  snapshot(): after that run, the copy (false when the position was not in the run).
+    void set_snapshot(int64_t pos);
+    bool snapshot(PrefillSnapshot& out) const;
     /// r6-pf: 0 = the CPU share's threads keep the host's inherited CPU pin (A/B); -1/1 = they move to CPUs 8-15
     static void set_pf_helper(int on);
     bool stage_current() const;

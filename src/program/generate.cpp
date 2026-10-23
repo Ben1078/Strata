@@ -9870,6 +9870,7 @@ int main(int argc, char** argv) {
             // r6-pf (STRATA_PF_TUNE cut_tail=N, testing): the prompt's last N tokens are read through the verify windows
             // as a part of their own (STRATA_LOGPOS then logs them, conditioned on what the prompt path read before)
             int64_t req_cut_tail = 0;
+            int req_inpass = -1;   // r6-pf: STRATA_PF_TUNE inpass= (-1: STRATA_PF_INPASS's)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (req_cut_tail > 0 && !no_short && a >= n - 1 - req_cut_tail) {
                     if (sp.embd_rows != nullptr)
@@ -9943,6 +9944,7 @@ int main(int argc, char** argv) {
                         else cst = std::clamp(std::atof(q + 11), 0.0, 0.95);
                     }
                     if (const char* q = std::strstr(buf, "cut_tail=")) req_cut_tail = std::max(0LL, std::atoll(q + 9));
+                    if (const char* q = std::strstr(buf, "inpass=")) req_inpass = std::atoi(q + 7) != 0 ? 1 : 0;
                 }
                 strata::prefill::Prefill::set_group_local(gloc);
                 strata::prefill::Prefill::set_pf_helper(phelp);
@@ -10412,6 +10414,24 @@ int main(int argc, char** argv) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
+            // r6-pf (opt-in STRATA_PF_INPASS=1, tune inpass=1): IN-PASS TURN CHECKPOINT.  A turn whose new part is cut
+            // only at its turn boundary (the conversation, then the effort / reminder tail and the assistant header) is
+            // read in ONE batched pass over [resume, n-1); the turn checkpoint is the running state the prompt path
+            // copies out where the tail begins (Prefill::set_snapshot: its stateful kernels split there - the bits of
+            // the two-part read).  The tail then costs no decode windows (~10 ms a token) or second batched pass, and
+            // the slots are refilled once.  Single GPU; not for a read short enough for the windows.
+            static const bool inpass_env = [] { const char* e = std::getenv("STRATA_PF_INPASS"); return e && e[0] == '1'; }();
+            int64_t inpass_at = -1;
+            if ((req_inpass < 0 ? inpass_env : req_inpass > 0) && stages.empty() && !multi_gpu && reread_to <= 0 &&
+                turn_at > read_from && turn_at < n - 1 && !windows_ok(read_from, n - 1)) {
+                bool only = true;
+                for (const int64_t c : cuts) if (c > read_from && c < n - 1 && c != turn_at) only = false;
+                if (only) {
+                    inpass_at = turn_at;
+                    cuts.assign(1, n - 1);
+                    sp.set_snapshot(inpass_at);
+                }
+            }
             int64_t at = read_from;
             // r6-pf: STRATA_PF_TURN_TIMING=1 - one line per request: where the prompt time went (lend, batched parts,
             // window parts, refills, checkpoints), the slots lent and the prompt path's expert counts
@@ -10482,6 +10502,33 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+            }
+            if (inpass_at > 0) {   // r6-pf: the turn checkpoint from the snapshot the pass took at its boundary
+                sp.set_snapshot(-1);
+                const auto tck = Clock::now();
+                strata::prefill::PrefillSnapshot sn;
+                if (!cancelled && sp.snapshot(sn)) {
+                    std::vector<ConvCheckpoint> parts(1);
+                    ConvCheckpoint& pc = parts[0];
+                    pc.gdn.assign(sn.gdn, sn.gdn + sn.gdn_bytes);
+                    pc.ple.assign(sn.ple, sn.ple + sn.ple_bytes);
+                    const size_t nq = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                    for (size_t j = 0; j < nq; ++j) {
+                        const uint8_t* q = sn.qsa + (size_t) (ss.qsa_ord0 + (int64_t) j) * sn.qsa_stride;
+                        pc.tails.insert(pc.tails.end(), q, q + sn.tail_bytes);
+                        pc.dead.insert(pc.dead.end(), q + sn.tail_bytes, q + sn.tail_bytes + sn.dead_bytes);
+                        pc.block_pos.insert(pc.block_pos.end(), q + sn.tail_bytes + sn.dead_bytes,
+                                            q + sn.tail_bytes + sn.dead_bytes + sizeof(int32_t));
+                    }
+                    if (!checkpoint_at(inpass_at, &parts)) {
+                        std::printf("ERR saving the in-pass turn checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                } else if (!cancelled) {
+                    std::fprintf(stderr, "strata serve: the in-pass turn checkpoint at %lld was not taken (none saved)\n",
+                                 (long long) inpass_at);
+                }
+                if (pf_tt) tt_ckpt += tt_ms(tck);
             }
             const auto trf = Clock::now();
             if (!refill(err)) {
