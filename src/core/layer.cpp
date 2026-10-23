@@ -41,6 +41,8 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <string>
+#include <cstdint>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
@@ -668,6 +670,251 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+
+// ================================ r7 (q5opt): THE ELASTIC CONTEXT STATE (STRATA_CTX_GROW) ================================
+namespace {
+bool g_ctx_on = false;
+int64_t g_ctx_init = 131072, g_ctx_step = 131072, g_ctx_max = 0;
+struct CtxArr {
+    uint8_t* va = nullptr;
+    uint64_t reserved = 0, mapped = 0, row_bytes = 0;
+    int64_t cells_per_row = 1, extra_rows = 0, max_rows = 0;
+    int kind = 0;               ///< 0: pooled keys (zero-filled), 1: RoPE cos, 2: RoPE sin
+    unsigned long long h = 0;
+};
+std::vector<CtxArr> g_ctx;
+uint64_t g_ctx_gran = 0;
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+#define STRATA_CTX_HIP 1
+hipMemAllocationProp ctx_prop(int dev) {
+    hipMemAllocationProp p{};
+    p.type = hipMemAllocationTypePinned;
+    p.location.type = hipMemLocationTypeDevice;
+    p.location.id = dev;
+    return p;
+}
+bool ctx_access(void* va, size_t n, int dev) {
+    hipMemAccessDesc a{};
+    a.location.type = hipMemLocationTypeDevice;
+    a.location.id = dev;
+    a.flags = hipMemAccessFlagsProtReadWrite;
+    return hipMemSetAccess(va, n, &a, 1) == hipSuccess;
+}
+#endif
+uint64_t ctx_round(uint64_t b) { const uint64_t g = g_ctx_gran ? g_ctx_gran : 1; return (b + g - 1) / g * g; }
+uint64_t ctx_bytes_for(const CtxArr& a, int64_t cells) {
+    int64_t rows = (cells + a.cells_per_row - 1) / a.cells_per_row + a.extra_rows;
+    if (rows > a.max_rows) rows = a.max_rows;
+    return std::min<uint64_t>(ctx_round((uint64_t) rows * a.row_bytes), a.reserved);
+}
+int64_t ctx_rows_mapped(const CtxArr& a) {
+    return std::min<int64_t>(a.max_rows, (int64_t) (a.mapped / a.row_bytes));
+}
+int64_t ctx_cells_of(const CtxArr& a) {
+    if (ctx_rows_mapped(a) >= a.max_rows) return g_ctx_max;
+    return std::max<int64_t>(0, (ctx_rows_mapped(a) - a.extra_rows) * a.cells_per_row);
+}
+// the RoPE rows [r0, r1) of the table, built on the host in float64 exactly as qsa_state_init builds the whole one
+bool ctx_rope_rows(const CtxArr& a, int64_t r0, int64_t r1, int n_rot) {
+    if (r1 <= r0) return true;
+    const size_t half = (size_t) n_rot / 2;
+    std::vector<float> hc((size_t) r1 * half), hs((size_t) r1 * half);
+    strata::kernels::build_rope_table(n_rot, strata::kernels::rope_scaling(), (int) r1, hc.data(), hs.data());
+    const std::vector<float>& src = a.kind == 1 ? hc : hs;
+    return cudaMemcpy(a.va + (size_t) r0 * a.row_bytes, src.data() + (size_t) r0 * half,
+                      (size_t) (r1 - r0) * a.row_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+int g_ctx_nrot = 64;
+// a new array: the address range for every row, one allocation for the first rows, zeroed (the RoPE rows filled)
+float* ctx_alloc(int kind, uint64_t row_bytes, int64_t cells_per_row, int64_t extra_rows, int64_t max_rows) {
+#if defined(STRATA_CTX_HIP)
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    CtxArr a;
+    a.kind = kind; a.row_bytes = row_bytes; a.cells_per_row = cells_per_row; a.extra_rows = extra_rows; a.max_rows = max_rows;
+    a.reserved = ctx_round((uint64_t) max_rows * row_bytes);
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, (size_t) a.reserved, 0, nullptr, 0) != hipSuccess || va == nullptr) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    a.va = (uint8_t*) va;
+    const uint64_t nb = ctx_bytes_for(a, g_ctx_init);
+    const hipMemAllocationProp prop = ctx_prop(dev);
+    hipMemGenericAllocationHandle_t h{};
+    if (hipMemCreate(&h, (size_t) nb, &prop, 0) != hipSuccess) { (void) hipGetLastError(); return nullptr; }
+    if (hipMemMap(va, (size_t) nb, 0, h, 0) != hipSuccess || !ctx_access(va, (size_t) nb, dev)) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    a.h = (unsigned long long) (uintptr_t) h;
+    a.mapped = nb;
+    if (cudaMemset(a.va, 0, (size_t) nb) != cudaSuccess) return nullptr;
+    if (kind != 0 && !ctx_rope_rows(a, 0, ctx_rows_mapped(a), g_ctx_nrot)) return nullptr;
+    g_ctx.push_back(a);
+    return (float*) a.va;
+#else
+    (void) kind; (void) row_bytes; (void) cells_per_row; (void) extra_rows; (void) max_rows;
+    return nullptr;
+#endif
+}
+// one array to `nb` bytes: a new allocation mapped at a scratch range, the kept prefix copied (device to device, each
+// side one allocation), the rest zeroed; then the old allocation leaves the array's range and the new one takes it
+bool ctx_remap(CtxArr& a, uint64_t nb, std::string& err, bool& fatal) {
+#if defined(STRATA_CTX_HIP)
+    if (nb == a.mapped) return true;
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    const hipMemAllocationProp prop = ctx_prop(dev);
+    hipMemGenericAllocationHandle_t h2{};
+    if (hipMemCreate(&h2, (size_t) nb, &prop, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        err = "no VRAM for the context state's next size";
+        return false;
+    }
+    void* tmp = nullptr;
+    if (hipMemAddressReserve(&tmp, (size_t) nb, 0, nullptr, 0) != hipSuccess || tmp == nullptr) {
+        (void) hipGetLastError();
+        (void) hipMemRelease(h2);
+        err = "cannot reserve a scratch range";
+        return false;
+    }
+    if (hipMemMap(tmp, (size_t) nb, 0, h2, 0) != hipSuccess || !ctx_access(tmp, (size_t) nb, dev)) {
+        (void) hipGetLastError();
+        (void) hipMemUnmap(tmp, (size_t) nb);
+        (void) hipMemAddressFree(tmp, (size_t) nb);
+        (void) hipMemRelease(h2);
+        err = "cannot map the context state's next size";
+        return false;
+    }
+    const uint64_t keep = std::min(a.mapped, nb);
+    bool ok = true;
+    if (keep > 0) ok = hipMemcpy(tmp, a.va, (size_t) keep, hipMemcpyDeviceToDevice) == hipSuccess;
+    if (ok && nb > keep) ok = hipMemset((uint8_t*) tmp + keep, 0, (size_t) (nb - keep)) == hipSuccess;
+    ok = ok && hipDeviceSynchronize() == hipSuccess;
+    (void) hipMemUnmap(tmp, (size_t) nb);
+    (void) hipMemAddressFree(tmp, (size_t) nb);
+    if (!ok) {
+        (void) hipGetLastError();
+        (void) hipMemRelease(h2);
+        err = "copying the context state failed";
+        return false;
+    }
+    if (a.mapped > 0) {
+        if (hipMemUnmap(a.va, (size_t) a.mapped) != hipSuccess) {
+            (void) hipGetLastError();
+            (void) hipMemRelease(h2);
+            err = "cannot unmap the context state";
+            fatal = true;
+            return false;
+        }
+        (void) hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) a.h);
+        a.h = 0;
+        a.mapped = 0;
+    }
+    // r7 v3: ROCm frees a released allocation only with its address range - free the range, take it again at the same
+    // address (the captured graphs hold it)
+    {
+        (void) hipMemAddressFree(a.va, (size_t) a.reserved);
+        void* got = nullptr;
+        if (hipMemAddressReserve(&got, (size_t) a.reserved, 0, a.va, 0) != hipSuccess || got != (void*) a.va) {
+            (void) hipGetLastError();
+            if (got != nullptr && got != (void*) a.va) (void) hipMemAddressFree(got, (size_t) a.reserved);
+            (void) hipMemRelease(h2);
+            err = "the context state's addresses could not be reserved again";
+            fatal = true;
+            return false;
+        }
+    }
+    if (hipMemMap(a.va, (size_t) nb, 0, h2, 0) != hipSuccess || !ctx_access(a.va, (size_t) nb, dev)) {
+        (void) hipGetLastError();
+        err = "the context state lost its memory (remap failed)";
+        fatal = true;
+        return false;
+    }
+    a.h = (unsigned long long) (uintptr_t) h2;
+    const int64_t r_old = std::min<int64_t>(a.max_rows, (int64_t) (keep / a.row_bytes));
+    a.mapped = nb;
+    if (a.kind != 0 && !ctx_rope_rows(a, r_old, ctx_rows_mapped(a), g_ctx_nrot)) {
+        err = "building the RoPE rows failed";
+        fatal = true;
+        return false;
+    }
+    return true;
+#else
+    (void) a; (void) nb; (void) fatal;
+    err = "the elastic context state needs HIP";
+    return false;
+#endif
+}
+const CtxArr* ctx_find(const void* va) {
+    for (const CtxArr& a : g_ctx)
+        if (a.va == (const uint8_t*) va) return &a;
+    return nullptr;
+}
+}  // namespace
+
+bool qsa_set_ctx_elastic(bool enabled, int64_t init_cells, int64_t step_cells, int64_t max_cells) {
+    g_ctx_on = false;
+    if (!enabled) return false;
+#if defined(STRATA_CTX_HIP)
+    int dev = 0, vmm = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, dev) != hipSuccess || !vmm) {
+        (void) hipGetLastError();
+        return false;
+    }
+    const hipMemAllocationProp prop = ctx_prop(dev);
+    size_t gr = 0;
+    if (hipMemGetAllocationGranularity(&gr, &prop, hipMemAllocationGranularityRecommended) != hipSuccess || gr == 0) {
+        (void) hipGetLastError();
+        return false;
+    }
+    g_ctx_gran = gr;
+    g_ctx_step = step_cells > 0 ? step_cells : 131072;
+    g_ctx_max = max_cells;
+    g_ctx_init = std::min<int64_t>(max_cells, std::max<int64_t>(g_ctx_step, (init_cells + g_ctx_step - 1) / g_ctx_step * g_ctx_step));
+    g_ctx_on = g_ctx_init < max_cells;
+    return g_ctx_on;
+#else
+    (void) init_cells; (void) step_cells; (void) max_cells;
+    return false;
+#endif
+}
+bool qsa_ctx_elastic() { return g_ctx_on && !g_ctx.empty(); }
+int64_t qsa_ctx_cells() {
+    if (!g_ctx_on || g_ctx.empty()) return std::numeric_limits<int64_t>::max();
+    int64_t c = std::numeric_limits<int64_t>::max();
+    for (const CtxArr& a : g_ctx) c = std::min(c, ctx_cells_of(a));
+    return c;
+}
+int64_t qsa_ctx_target(int64_t cells) {
+    const int64_t t = (std::max<int64_t>(cells, 1) + g_ctx_step - 1) / g_ctx_step * g_ctx_step;
+    return std::max<int64_t>(std::min<int64_t>(t, g_ctx_max), std::min<int64_t>(g_ctx_init, g_ctx_max));
+}
+uint64_t qsa_ctx_need(int64_t target) {
+    uint64_t grow = 0, peak = 0;
+    for (const CtxArr& a : g_ctx) {
+        const uint64_t nb = ctx_bytes_for(a, target);
+        if (nb > a.mapped) grow += nb - a.mapped;
+        if (nb != a.mapped) peak = std::max(peak, std::min(nb, a.mapped));
+    }
+    return grow == 0 ? 0 : grow + peak + g_ctx_gran;
+}
+bool qsa_ctx_resize(int64_t target, std::string& err, bool& fatal) {
+    fatal = false;
+    if (!qsa_ctx_elastic()) return true;
+    for (CtxArr& a : g_ctx)
+        if (!ctx_remap(a, ctx_bytes_for(a, target), err, fatal)) return false;
+    return true;
+}
+uint64_t qsa_ctx_mapped_bytes() { uint64_t n = 0; for (const CtxArr& a : g_ctx) n += a.mapped; return n; }
+uint64_t qsa_ctx_full_bytes() { uint64_t n = 0; for (const CtxArr& a : g_ctx) n += a.reserved; return n; }
+int64_t qsa_pooled_rows_mapped(const QsaState& st) {
+    if (const CtxArr* a = ctx_find(st.idx_pooled)) return ctx_rows_mapped(*a);
+    return st.idx_pooled_rows;
+}
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
@@ -679,9 +926,10 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!(g_ctx_on && p.pooled_rows > 2))                                      // r7: elastic -> its own range
+        n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                         // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !g_ctx_on) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -777,11 +1025,27 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (g_ctx_on && p.pooled_rows > 2) {   // r7: the elastic context state (its own range, first rows mapped)
+        st.idx_pooled = ctx_alloc(0, (uint64_t) s.idx_dim * 4, s.idx_block, 2, p.pooled_rows);
+        if (st.idx_pooled == nullptr) {
+            std::fprintf(stderr, "strata: the elastic context state could not allocate a layer's pooled keys\n");
+            return 0;
+        }
+    } else {
+        st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    }
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
+    } else if (g_ctx_on) {
+        g_ctx_nrot = (int) s.n_rot;
+        st.cos_tab = ctx_alloc(1, (uint64_t) (s.n_rot / 2) * 4, 1, 0, max_cells);
+        st.sin_tab = ctx_alloc(2, (uint64_t) (s.n_rot / 2) * 4, 1, 0, max_cells);
+        if (st.cos_tab == nullptr || st.sin_tab == nullptr) {
+            std::fprintf(stderr, "strata: the elastic context state could not allocate the RoPE table\n");
+            return 0;
+        }
     } else {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
@@ -854,7 +1118,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
-    if (share_rope == nullptr) {
+    if (share_rope == nullptr && g_ctx_on) {   // r7: ctx_alloc built the mapped rows; the table's length is the context
+        st.owns_rope = true;
+        if (s.n_rot == 64)
+            strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
+    } else if (share_rope == nullptr) {
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
@@ -907,7 +1175,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) qsa_pooled_rows_mapped(st) * s.idx_dim * 4, cs);   // r7: mapped rows
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {

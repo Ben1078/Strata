@@ -288,6 +288,30 @@ void qsa_set_kv_resident(int64_t cells);
 /// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
+/// r7 (q5opt) THE ELASTIC CONTEXT STATE (STRATA_CTX_GROW=1, HIP virtual memory management).  The two arrays that scale
+/// with --max-context and are not K/V - the indexer's pooled keys of every streamed QSA layer ((cells/4 + 2) x 128
+/// fp32, 128 MiB per layer at 1M) and the RoPE cos/sin table (cells x 32 x 2 fp32, 256 MiB at 1M) - get an address
+/// range for the whole context but ONE physical allocation covering only the first `init_cells` (rounded to `step`).
+/// `qsa_ctx_resize` moves each array to a new single allocation of the new size (contents of the kept prefix copied,
+/// the new pooled rows zeroed - as session_zero leaves them -, the new RoPE rows built on the host exactly as at
+/// start), so every address stays (captured graphs) and a runtime copy never spans two allocations.  Numerics are
+/// unchanged: nothing reads a row past the cells in use.  Set before sizing and initializing the session; off (or no
+/// VMM): the static allocation as always.  Serve mode, one GPU.
+bool qsa_set_ctx_elastic(bool enabled, int64_t init_cells, int64_t step_cells, int64_t max_cells);
+bool qsa_ctx_elastic();
+/// Cells every elastic array covers now (INT64_MAX when off).
+int64_t qsa_ctx_cells();
+/// `cells` rounded up to the step, at most the context.
+int64_t qsa_ctx_target(int64_t cells);
+/// VRAM a resize to `target` (qsa_ctx_target) takes at its peak beyond what is mapped now (0: nothing to grow).
+uint64_t qsa_ctx_need(int64_t target);
+/// Synchronous; nothing may run on the device.  false + err: out of memory (nothing changed) or, with `fatal`, a
+/// failure after an array lost its mapping (the engine must stop).
+bool qsa_ctx_resize(int64_t target, std::string& err, bool& fatal);
+uint64_t qsa_ctx_mapped_bytes();
+uint64_t qsa_ctx_full_bytes();
+/// Rows of `st.idx_pooled` backed by memory now (all of them unless elastic).
+int64_t qsa_pooled_rows_mapped(const QsaState& st);
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.

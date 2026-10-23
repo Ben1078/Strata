@@ -3729,11 +3729,33 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
+        {   // r7 (q5opt): STRATA_CTX_GROW=1 - the pooled indexer keys and the RoPE table mapped only as far as the
+            // context in use (STRATA_CTX_GROW_INIT / _STEP cells, default 131072), grown and shrunk between windows
+            const char* cv = std::getenv("STRATA_CTX_GROW");
+            const bool asked = cv != nullptr && cv[0] != '\0' && cv[0] != '0';
+            const char* iv = std::getenv("STRATA_CTX_GROW_INIT");
+            const char* sv = std::getenv("STRATA_CTX_GROW_STEP");
+            const int64_t step = sv != nullptr && std::atoll(sv) > 0 ? std::atoll(sv) : 131072;
+            const bool can = asked && o.serve && !multi_gpu && o.batch == 0 && o.peer_device < 0 &&
+                             !strata::core::qsa_kv_elastic();
+            const bool on = strata::core::qsa_set_ctx_elastic(can, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : step,
+                                                              step, o.max_context);
+            if (asked && !on)
+                std::fprintf(stderr, "strata generate: STRATA_CTX_GROW is off (--serve, one GPU, no --batch / "
+                                     "--peer-device / --kv-grow, HIP virtual memory management, a context above the "
+                                     "first step)\n");
+        }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0 ||
+            (strata::core::qsa_ctx_elastic() &&
+             (std::fprintf(stderr, "strata generate: elastic context state (STRATA_CTX_GROW): %lld of %lld cells "
+                                   "mapped, %.0f of %.0f MiB (pooled indexer keys + RoPE table)\n",
+                           (long long) std::min<int64_t>(strata::core::qsa_ctx_cells(), o.max_context),
+                           (long long) o.max_context, (double) strata::core::qsa_ctx_mapped_bytes() / 1048576.0,
+                           (double) strata::core::qsa_ctx_full_bytes() / 1048576.0), false))) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -4487,7 +4509,11 @@ int main(int argc, char** argv) {
                     const int64_t first = std::max<int64_t>(1, n_all * band_at / 100);
                     int64_t n = 0, b = 0;
                     while (first + n < n_all - 1 && b < (band_mib << 20)) b += (sized_slots[(size_t) (first + n++)] + 255) / 256 * 256;
-                    xcache.set_band(first, n);
+                    static const int64_t seg_mib = [] {   // r7-ctx: released / restored one segment at a time
+                        const char* v = std::getenv("STRATA_VRAM_BAND_SEG_MIB");
+                        return v ? std::max<int64_t>(16, std::atoll(v)) : (int64_t) 256;
+                    }();
+                    xcache.set_band(first, n, seg_mib << 20);
                 } else if (band_mib > 0 && attempt == 0) {
                     std::fprintf(stderr, "strata generate: STRATA_VRAM_BAND_MIB is off here (one GPU, --serve, a native "
                                          "pack, no --vram-elastic / --batch / --peer-device)\n");
@@ -4550,9 +4576,10 @@ int main(int argc, char** argv) {
                      (long long) xcache.slots(), xcache.gib());
         if (xcache.band_on())
             std::fprintf(stderr, "strata generate: releasable band (STRATA_VRAM_BAND_MIB): slots %lld..%lld, %lld MiB "
-                                 "in its own allocation - VRAM <reserve_mib> gives it back, VRAM takes it again\n",
+                                 "in %d segments - VRAM <reserve_mib> / a growing context give them back, VRAM takes "
+                                 "them again\n",
                          (long long) xcache.band_first(), (long long) xcache.band_end() - 1,
-                         (long long) (xcache.band_bytes() >> 20));
+                         (long long) (xcache.band_bytes() >> 20), xcache.band_segments());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -8042,13 +8069,19 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
-        // ---- r7 (q5opt): VRAM <reserve_mib> with the releasable band (STRATA_VRAM_BAND_MIB).  All or nothing: when
-        // less than reserve_mib is free, every expert in the band's slots becomes a miss (the CPU computes it from RAM,
-        // or from the model files when the RAM copy does not hold it - it was in VRAM) and the band's VRAM goes back
-        // to the driver; a bare `VRAM` (or a reserve that still fits with the band mapped) maps it again and refills
-        // each slot with the expert it held (or, when the adaptive tier brought that one back meanwhile, the layer's
-        // most-routed miss).  The prompt path's loan never reaches the band (refused if it would).
-        auto vram_band = [&](long long reserve, bool bare, std::string& e) -> bool {
+        // ---- r7 (q5opt): the releasable band (STRATA_VRAM_BAND_MIB), in segments, and the elastic context state
+        // (STRATA_CTX_GROW) share one rule: the free VRAM.  A segment going out: every expert in its slots becomes a
+        // miss (the CPU computes it from RAM, or from the model files when the RAM copy does not hold it - it was in
+        // VRAM), then its VRAM goes back to the driver.  A segment coming back: each slot gets the expert it held (or,
+        // when the adaptive tier brought that one back meanwhile, the layer's most-routed miss).  Segments go out from
+        // the band's end and come back from its start.  The prompt path's loan never reaches the band.
+        int64_t vram_hold = 0;   // bytes the last `VRAM <reserve>` asked to keep free (0: a bare VRAM)
+        static const int64_t band_floor = [] {
+            const char* v = std::getenv("STRATA_VRAM_BAND_FLOOR_MIB");
+            return (v ? (int64_t) std::atoll(v) : (int64_t) 320) << 20;
+        }();
+        auto free_now = [&]() -> int64_t { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t); return (int64_t) f; };
+        auto band_ready = [&](std::string& e) -> bool {   // nothing lent, nothing in flight that could write a slot
             for (const PfPart& p : pf_parts) {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
                 if (p.first >= 0 && p.first < xcache.band_end()) {
@@ -8057,96 +8090,184 @@ int main(int argc, char** argv) {
                 }
             }
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
-            if (!ver.wait_commit(e)) return false;
             if (!adapt_tick(true)) { e = "VRAM: the adaptive tier's copy failed"; return false; }
             apply_pending(true);
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
-            const auto t0 = Clock::now();
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
-            const int64_t want_free = (int64_t) reserve << 20, band_b = xcache.band_bytes();
-            const int64_t b0 = xcache.band_first(), b1 = xcache.band_end();
-            const int64_t before = xcache.slots() - (xcache.band_mapped() ? 0 : xcache.band_slots());
-            // a bare VRAM restores the band while ~320 MiB stay free beside it (the start's own reserve was spent on
-            // the verify windows and the drafter after the cache was sized)
-            static const int64_t floor_b = [] {
-                const char* v = std::getenv("STRATA_VRAM_BAND_FLOOR_MIB");
-                return (v ? (int64_t) std::atoll(v) : (int64_t) 320) << 20;
-            }();
-            std::string note;
-            if (xcache.band_mapped() && !bare && (int64_t) free_b < want_free) {
-                int64_t moved = 0;
-                for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= b0 && host_res[i] < b1) {
-                        vram_evicted.emplace_back((int32_t) i, host_res[i]);
-                        host_res[i] = strata::core::kNotResident;
-                        ++moved;
-                    }
-                res_upload();
-                if (cudaDeviceSynchronize() != cudaSuccess || !xcache.band_release(e)) {
-                    if (e.empty()) e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
-                    return false;
+            return true;
+        };
+        auto band_seg_out = [&](int si, std::string& e) -> int64_t {
+            const int64_t b0 = xcache.band_seg_first(si), b1 = xcache.band_seg_end(si);
+            int64_t moved = 0;
+            std::vector<std::pair<int32_t, int32_t>> adv;
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= b0 && host_res[i] < b1) {
+                    vram_evicted.emplace_back((int32_t) i, host_res[i]);
+                    adv.emplace_back((int32_t) (i / g.n_expert), (int32_t) (i % g.n_expert));
+                    host_res[i] = strata::core::kNotResident;
+                    ++moved;
                 }
-                // the evicted experts the RAM copy does not hold are read from the model files now: ask the OS for
-                // their pages while the encoder starts (64 pairs per call, as the profile fill does)
-                std::vector<std::pair<int32_t, int32_t>> adv;
-                for (const auto& [i, slot] : vram_evicted)
-                    if (slot >= b0 && slot < b1) adv.emplace_back((int32_t) (i / g.n_expert), (int32_t) (i % g.n_expert));
-                for (size_t k = 0; k < adv.size(); k += 64)
-                    (void) srcp->advise_pairs(adv.data() + k, (int64_t) std::min<size_t>(64, adv.size() - k));
-                note = " (band released: " + std::to_string(moved) + " experts now misses)";
-            } else if (!xcache.band_mapped() && (int64_t) free_b - band_b >= (bare ? floor_b : want_free)) {
-                if (!xcache.band_restore(e)) return false;
-                std::string ferr;
-                std::vector<std::pair<int32_t, int32_t>> keep_out;
-                int64_t refilled = 0;
-                for (const auto& [i, slot] : vram_evicted) {
-                    if (slot < b0 || slot >= b1) { keep_out.emplace_back(i, slot); continue; }
-                    const int64_t layer = i / g.n_expert;
-                    int64_t pick = i;
-                    if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
-                        pick = -1;
-                        float best = -1.0f;
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t j = (size_t) (layer * g.n_expert + ex);
-                            if (host_res[j] >= 0) continue;
-                            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
-                            if (u > best) { best = u; pick = (int64_t) j; }
-                        }
-                    }
-                    if (pick < 0) continue;
-                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_blocking(slot, b, ferr,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
-                        e = "VRAM: refilling the band failed: " + ferr;
-                        res_upload();
-                        return false;
-                    }
-                    host_res[(size_t) pick] = slot;
-                    ++refilled;
-                }
-                vram_evicted.swap(keep_out);
-                res_upload();
-                note = " (band restored: " + std::to_string(refilled) + " experts back)";
-            } else if (!xcache.band_mapped()) {
-                note = " (the band stays released: too little VRAM free for it)";
+            res_upload();
+            if (cudaDeviceSynchronize() != cudaSuccess || !xcache.band_seg_release(si, e)) {
+                if (e.empty()) e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
+                return -1;
             }
-            cudaMemGetInfo(&free_b, &total_b);
-            const int64_t live = xcache.slots() - (xcache.band_mapped() ? 0 : xcache.band_slots());
+            // the evicted experts the RAM copy does not hold are read from the model files now: ask for their pages
+            for (size_t k = 0; k < adv.size(); k += 64)
+                (void) srcp->advise_pairs(adv.data() + k, (int64_t) std::min<size_t>(64, adv.size() - k));
+            return moved;
+        };
+        auto band_seg_in = [&](int si, std::string& e) -> int64_t {
+            if (!xcache.band_seg_restore(si, e)) return -1;
+            const int64_t b0 = xcache.band_seg_first(si), b1 = xcache.band_seg_end(si);
+            std::string ferr;
+            std::vector<std::pair<int32_t, int32_t>> keep_out;
+            int64_t refilled = 0;
+            for (const auto& [i, slot] : vram_evicted) {
+                if (slot < b0 || slot >= b1) { keep_out.emplace_back(i, slot); continue; }
+                const int64_t layer = i / g.n_expert;
+                int64_t pick = i;
+                if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
+                    pick = -1;
+                    float best = -1.0f;
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t j = (size_t) (layer * g.n_expert + ex);
+                        if (host_res[j] >= 0) continue;
+                        const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
+                        if (u > best) { best = u; pick = (int64_t) j; }
+                    }
+                }
+                if (pick < 0) continue;
+                const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
+                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, ferr,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    e = "VRAM: refilling the band failed: " + ferr;
+                    res_upload();
+                    return -1;
+                }
+                host_res[(size_t) pick] = slot;
+                ++refilled;
+            }
+            vram_evicted.swap(keep_out);
+            res_upload();
+            return refilled;
+        };
+        // segments out (from the band's end) until `want_free` bytes are free; `quiet`: band_ready already ran
+        auto band_fit = [&](int64_t want_free, std::string& note, std::string& e) -> bool {
+            if (!xcache.band_on() || free_now() >= want_free) return true;
+            int out = 0;
+            int64_t moved = 0;
+            for (int si = xcache.band_segments() - 1; si >= 0 && free_now() < want_free; --si) {
+                if (!xcache.band_seg_mapped(si)) continue;
+                const int64_t m = band_seg_out(si, e);
+                if (m < 0) return false;
+                ++out;
+                moved += m;
+            }
+            if (out > 0) note += " (band: " + std::to_string(out) + " segments out, " + std::to_string(moved) + " experts now misses)";
+            return true;
+        };
+        // segments back (from the band's start) while `keep_free` bytes stay free beside each
+        auto band_regrow = [&](int64_t keep_free, std::string& note, std::string& e) -> bool {
+            if (!xcache.band_on() || xcache.band_mapped()) return true;
+            int in = 0;
+            int64_t refilled = 0;
+            for (int si = 0; si < xcache.band_segments(); ++si) {
+                if (xcache.band_seg_mapped(si)) continue;
+                if (free_now() - xcache.band_seg_bytes(si) < keep_free) break;
+                const int64_t r = band_seg_in(si, e);
+                if (r < 0) return false;
+                ++in;
+                refilled += r;
+            }
+            if (in > 0) note += " (band: " + std::to_string(in) + " segments back, " + std::to_string(refilled) + " experts back)";
+            if (!xcache.band_mapped()) note += " (band: " + std::to_string(xcache.band_unmapped_slots()) + " slots stay out)";
+            return true;
+        };
+        auto live_slots = [&]() { return xcache.slots() - xcache.band_unmapped_slots(); };
+        auto vram_band = [&](long long reserve, bool bare, std::string& e) -> bool {
+            if (!ver.wait_commit(e)) return false;
+            if (!band_ready(e)) return false;
+            const auto t0 = Clock::now();
+            const int64_t before = live_slots();
+            vram_hold = bare ? 0 : (int64_t) reserve << 20;
+            std::string note;
+            const bool ok = (!bare && free_now() < vram_hold) ? band_fit(vram_hold, note, e)
+                                                              : band_regrow(std::max(band_floor, vram_hold), note, e);
+            if (!ok) return false;
+            const bool blocked = bare && !xcache.band_mapped();   // regrow stopped short (the context state holds VRAM)
+            const int64_t fb = free_now();
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
                                  "(%.2f of %.2f GiB), %lld MiB free now, in %.0f ms%s\n",
-                         reserve, (long long) before, (long long) live, (long long) xcache.full_slots(),
+                         reserve, (long long) before, (long long) live_slots(), (long long) xcache.full_slots(),
                          (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
-                         (long long) (free_b >> 20),
+                         (long long) (fb >> 20),
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
             std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld band_mapped=%d\n", reserve,
-                        (long long) live, (long long) xcache.full_slots(),
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld band_mapped=%d band_blocked=%d\n",
+                        reserve, (long long) live_slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
-                        (long long) (free_b >> 20), (long long) o.prefill_chunk, xcache.band_mapped() ? 1 : 0);
+                        (long long) (fb >> 20), (long long) o.prefill_chunk, xcache.band_mapped() ? 1 : 0,
+                        blocked ? 1 : 0);
+            return true;
+        };
+        // ---- r7: the elastic context state.  `cells` (+ a margin for the scorers' tiles) must be covered before
+        // anything writes or reads them; growing takes its VRAM from the band when the free VRAM is short.
+        constexpr int64_t kCtxMargin = 4096;
+        auto ctx_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+            if (!strata::core::qsa_ctx_elastic() || cells + kCtxMargin <= strata::core::qsa_ctx_cells()) return true;
+            const int64_t target = strata::core::qsa_ctx_target(cells + kCtxMargin);
+            const uint64_t need = strata::core::qsa_ctx_need(target);
+            const auto t0 = Clock::now();
+            const int64_t had = strata::core::qsa_ctx_cells();
+            quiesce();
+            std::string note, e;
+            if (free_now() < (int64_t) need + band_floor && xcache.band_on()) {
+                if (!band_ready(e) || !band_fit((int64_t) need + band_floor, note, e)) {
+                    std::fprintf(stderr, "strata serve: the context state could not take VRAM from the band: %s\n", e.c_str());
+                    e.clear();
+                }
+            }
+            bool fatal = false;
+            if (!strata::core::qsa_ctx_resize(target, e, fatal)) {
+                std::fprintf(stderr, "strata serve: the context state could not grow to %lld cells: %s%s\n",
+                             (long long) target, e.c_str(), fatal ? " (fatal)" : "");
+                return false;
+            }
+            std::fprintf(stderr, "strata serve: context state grown %lld -> %lld cells (%.0f MiB), in %.0f ms%s\n",
+                         (long long) std::min<int64_t>(had, o.max_context),
+                         (long long) std::min<int64_t>(strata::core::qsa_ctx_cells(), o.max_context),
+                         (double) strata::core::qsa_ctx_mapped_bytes() / 1048576.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
+            return true;
+        };
+        // a request that needs far fewer cells: the state shrinks (keeping a parked conversation's cells,
+        // STRATA_CTX_GROW_HOLD=0 drops that) and the band takes the VRAM back.  On a quiet device.
+        auto ctx_trim = [&](int64_t cells, int64_t hold) -> bool {
+            std::string note, e;
+            if (strata::core::qsa_ctx_elastic()) {
+                const int64_t target = strata::core::qsa_ctx_target(std::max(cells, hold) + kCtxMargin);
+                const int64_t had = strata::core::qsa_ctx_cells();
+                if (target < had) {
+                    bool fatal = false;
+                    if (!strata::core::qsa_ctx_resize(target, e, fatal)) {
+                        std::fprintf(stderr, "strata serve: the context state could not shrink: %s\n", e.c_str());
+                        if (fatal) return false;
+                        e.clear();
+                    } else {
+                        note = " (context state " + std::to_string(std::min<int64_t>(had, o.max_context)) + " -> " +
+                               std::to_string(strata::core::qsa_ctx_cells()) + " cells)";
+                    }
+                }
+            }
+            if (xcache.band_on() && !xcache.band_mapped()) {
+                std::string e2;
+                if (!band_ready(e2) || !band_regrow(std::max(band_floor, vram_hold), note, e2))
+                    std::fprintf(stderr, "strata serve: the band did not come back: %s\n", e2.c_str());
+            }
+            if (!note.empty()) std::fprintf(stderr, "strata serve: VRAM between requests:%s\n", note.c_str());
             return true;
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
@@ -8861,6 +8982,10 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                    if (!ctx_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                        refuse("the context state cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
+                        continue;
+                    }
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
@@ -9129,6 +9254,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
+            if (!ctx_ensure(n + 256, kv_quiesce)) {   // r7: the elastic context state, this prompt's cells
+                std::printf("ERR the context state cannot grow to this prompt: no VRAM is left\n");
+                std::fflush(stdout);
+                return 1;
+            }
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
@@ -9270,6 +9400,10 @@ int main(int argc, char** argv) {
                 }
             }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
+            if (incoming && !ctx_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
+                std::printf("ERR the context state cannot grow to the parked conversation: no VRAM is left\n");
+                return 1;
+            }
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
@@ -9345,6 +9479,15 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            if (strata::core::qsa_ctx_elastic() || (xcache.band_on() && !xcache.band_mapped())) {   // r7
+                static const bool ctx_hold = [] { const char* v = std::getenv("STRATA_CTX_GROW_HOLD"); return v == nullptr || std::atoi(v) != 0; }();
+                kv_quiesce();
+                if (!ctx_trim(n + 256, ctx_hold ? conversations.longest_tokens() + 256 : 0)) {
+                    std::printf("ERR the context state lost its memory\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
@@ -10870,6 +11013,12 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on_h(hist_dev);
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
+                }
+                // r7: the elastic context state, the window's cells (grows in steps, rarely)
+                if (p + T + 64 + kCtxMargin > strata::core::qsa_ctx_cells() &&
+                    !ctx_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    std::printf("ERR the context state cannot grow: no VRAM is left\n");
+                    return 1;
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&

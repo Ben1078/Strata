@@ -2651,6 +2651,15 @@ class Service:
             print(f"[strata] vision on demand: less than need_mib={od.get('need_mib', 1600)} MiB free: the encoder "
                   "runs on the CPU", flush=True)
             return False
+        # r7 v3: the driver frees released VRAM a moment later (delayed destroy, measured <= 3 s): wait until the card
+        # itself (amdgpu sysfs) shows it, so the encoder's allocations never meet a full card
+        t0, card = time.time(), None
+        while time.time() - t0 < 4.0:
+            card = self.free_vram_mib()
+            if card is None or card >= int(od.get("need_mib", 1600)):
+                break
+            time.sleep(0.25)
+        print(f"[strata] vision on demand: the card shows {card} MiB free after {time.time() - t0:.1f} s", flush=True)
         return True
 
     def _vision_reap(self):
@@ -2670,10 +2679,12 @@ class Service:
             if stop:
                 v.close()
                 print(f"[strata] vision on demand: the encoder stopped after {od.get('idle_s', 300)} s idle", flush=True)
-                time.sleep(1.0)                       # the driver takes the encoder's VRAM back
+                time.sleep(3.5)                       # the driver takes the encoder's VRAM back (delayed, <= 3 s)
             if self.vision_shrunk and not v.alive() and hasattr(self.engine, "alive") and self.engine.alive():
                 out = self.engine.vram(None)
-                if int(out.get("band_mapped", 1)) == 1:
+                # r7-ctx: band_blocked - the rest of the band stays out for a long context (the engine takes it back
+                # by itself when that context ends)
+                if int(out.get("band_mapped", 1)) == 1 or int(out.get("band_blocked", 0)) == 1:
                     self.vision_shrunk = False
                 print(f"[strata] vision on demand: expert cache {out.get('expert_slots')} of "
                       f"{out.get('expert_slots_full')} slots, {out.get('vram_free_mib')} MiB free", flush=True)

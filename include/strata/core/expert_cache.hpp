@@ -141,17 +141,30 @@ public:
     /// the band's VRAM goes back to the driver - for the vision encoder.  `band_restore` maps it again (empty: the
     /// caller refills).  The loan (the last slots) never reaches the band (checked by the caller).  Set before
     /// `open_sized`; 0 slots or a GPU without virtual memory management: one allocation as always.
-    void set_band(int64_t first_slot, int64_t n_slots) { band_req_first_ = first_slot; band_req_n_ = n_slots; }
+    void set_band(int64_t first_slot, int64_t n_slots, int64_t seg_bytes = 0) {
+        band_req_first_ = first_slot; band_req_n_ = n_slots; band_req_seg_ = seg_bytes;
+    }
     static bool band_supported();
     bool band_on() const { return band_n_ > 0; }
-    bool band_mapped() const { return band_n_ > 0 && band_mapped_; }
+    /// r7-ctx: the band is cut into SEGMENTS (set_band's seg_bytes; 0: one segment), each its own physical allocation,
+    /// released / restored one at a time (the vision encoder takes several, a growing context as many as it needs).
+    int band_segments() const { return band_n_ > 0 ? (int) parts_.size() - 2 : 0; }
+    int64_t band_seg_first(int i) const { return parts_[(size_t) i + 1].s0; }
+    int64_t band_seg_end(int i) const { return parts_[(size_t) i + 1].s1; }
+    bool band_seg_mapped(int i) const { return parts_[(size_t) i + 1].mapped; }
+    int64_t band_seg_bytes(int i) const { return (int64_t) (parts_[(size_t) i + 1].hi - parts_[(size_t) i + 1].lo); }
+    bool band_seg_release(int i, std::string& err);
+    bool band_seg_restore(int i, std::string& err);
+    bool band_mapped() const;                 ///< every segment mapped
+    bool band_release(std::string& err);      ///< every segment out
+    bool band_restore(std::string& err);      ///< every segment back
+    int64_t band_unmapped_slots() const;
+    int64_t band_unmapped_bytes() const;
     int64_t band_first() const { return band_first_; }
     int64_t band_end() const { return band_first_ + band_n_; }
     int64_t band_slots() const { return band_n_; }
-    int64_t band_bytes() const { return (int64_t) band_size_; }
-    bool band_release(std::string& err);
-    bool band_restore(std::string& err);
-    /// Zeroes the whole arena (one memset per physical allocation in band mode; ROCm refuses one across them).
+    int64_t band_bytes() const;
+    /// Zeroes the whole arena (one memset per mapped physical allocation in band mode; ROCm refuses one across them).
     bool zero_all();
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
@@ -249,16 +262,21 @@ private:
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
-    // r7 band (set_band): the arena = [0, band_lo_) + [band_lo_, band_lo_ + band_size_) + the rest, three physical
-    // allocations in one reserved range of band_total_ bytes
+    // r7 band (set_band): the arena = the slots before the band + its segments + the slots after it, each part one
+    // physical allocation, all in one reserved range of band_total_ bytes
+    // r7 v3: each part is its own address reservation (contiguous with the others): ROCm keeps a released physical
+    // allocation until its address range is freed, so a segment going out frees its range and reserves it again at
+    // the same address (empty).  `lost`: the address could not be had again - the segment stays out for good.
+    struct Part { uint64_t lo = 0, hi = 0; unsigned long long h = 0; bool mapped = false, reserved = false, lost = false;
+                  int64_t s0 = 0, s1 = 0; };
     bool open_band(uint64_t want, std::string& err);
     void release_band();
-    int64_t band_req_first_ = 0, band_req_n_ = 0;
+    std::vector<Part> parts_;
+    std::vector<uint64_t> band_cut_;          ///< planned part boundaries (bytes), open_sized -> open_band
+    std::vector<int64_t> band_cut_slots_;     ///< the same boundaries in slots
+    int64_t band_req_first_ = 0, band_req_n_ = 0, band_req_seg_ = 0;
     int64_t band_first_ = 0, band_n_ = 0;
-    uint64_t band_lo_ = 0, band_size_ = 0, band_total_ = 0;   ///< byte offsets/sizes (granularity-aligned)
-    uint64_t band_gran_ = 0;
-    unsigned long long band_h_[3] = {0, 0, 0};   ///< physical handles: before, band, after (0: none/unmapped)
-    bool band_mapped_ = false;
+    uint64_t band_total_ = 0, band_gran_ = 0;
     bool band_layout_ = false;   ///< open() allocates through open_band (set by open_sized)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

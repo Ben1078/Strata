@@ -366,7 +366,7 @@ void ExpertCache::release_segmented() {
 
 int64_t ExpertCache::mapped_bytes() const {
     if (segs_.empty())
-        return base_ != nullptr ? full_bytes() - (band_n_ > 0 && !band_mapped_ ? (int64_t) band_size_ : 0) : 0;
+        return base_ != nullptr ? full_bytes() - band_unmapped_bytes() : 0;
     int64_t b = 0;
     for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
     return b;
@@ -495,6 +495,19 @@ bool band_map(int dev, uint8_t* va, size_t bytes, unsigned long long& handle) {
     handle = (unsigned long long) (uintptr_t) h;
     return true;
 }
+// a reservation of `bytes` exactly at `at` (false, nothing held, when the driver hands back another address)
+bool band_reserve_at(uint8_t* at, size_t bytes) {
+    void* got = nullptr;
+    if (hipMemAddressReserve(&got, bytes, 0, at, 0) != hipSuccess || got == nullptr) {
+        (void) hipGetLastError();
+        return false;
+    }
+    if (got != (void*) at) {
+        (void) hipMemAddressFree(got, bytes);
+        return false;
+    }
+    return true;
+}
 bool band_unmap(uint8_t* va, size_t bytes, unsigned long long handle) {
     const bool a = hipMemUnmap(va, bytes) == hipSuccess;
     const bool b = hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) handle) == hipSuccess;
@@ -524,6 +537,7 @@ bool ExpertCache::open_band(uint64_t want, std::string& err) {
     (void) hipGetDevice(&dev);
     const uint64_t g = band_gran_ > 0 ? band_gran_ : 1;
     band_total_ = (want + g - 1) / g * g;
+    // a hole of the whole size, then one reservation per part inside it, each at its exact address
     void* va = nullptr;
     if (hipMemAddressReserve(&va, (size_t) band_total_, 0, nullptr, 0) != hipSuccess || va == nullptr) {
         (void) hipGetLastError();
@@ -531,21 +545,41 @@ bool ExpertCache::open_band(uint64_t want, std::string& err) {
         band_total_ = 0;
         return false;
     }
+    (void) hipMemAddressFree(va, (size_t) band_total_);
     base_ = (uint8_t*) va;
-    const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
-    const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
-    for (int i = 0; i < 3; ++i) {
-        if (to[i] <= from[i]) continue;
-        if (!band_map(dev, base_ + from[i], (size_t) (to[i] - from[i]), band_h_[i])) {
+    parts_.clear();
+    std::vector<uint64_t> cut = band_cut_;
+    cut.back() = band_total_;
+    for (size_t j = 0; j + 1 < cut.size(); ++j) {
+        Part pt;
+        pt.lo = cut[j];
+        pt.hi = cut[j + 1];
+        pt.s0 = band_cut_slots_[j];
+        pt.s1 = band_cut_slots_[j + 1];
+        parts_.push_back(pt);
+    }
+    for (Part& pt : parts_) {
+        if (pt.hi <= pt.lo) continue;
+        if (!band_reserve_at(base_ + pt.lo, (size_t) (pt.hi - pt.lo))) {
+            err = "ExpertCache: band: the parts' address ranges could not be reserved side by side";
+            release_band();
+            return false;
+        }
+        pt.reserved = true;
+    }
+    for (size_t j = 0; j < parts_.size(); ++j) {
+        Part& pt = parts_[j];
+        if (pt.hi <= pt.lo) continue;
+        if (!band_map(dev, base_ + pt.lo, (size_t) (pt.hi - pt.lo), pt.h)) {
             char buf[200];
-            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: part %d of the band layout (%.2f GiB) "
-                          "could not be allocated", i + 1, (double) (to[i] - from[i]) / 1073741824.0);
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: part %zu of the band layout (%.2f GiB) "
+                          "could not be allocated", j + 1, (double) (pt.hi - pt.lo) / 1073741824.0);
             err = buf;
             release_band();
             return false;
         }
+        pt.mapped = true;
     }
-    band_mapped_ = true;
     return true;
 #else
     (void) want;
@@ -557,69 +591,112 @@ bool ExpertCache::open_band(uint64_t want, std::string& err) {
 void ExpertCache::release_band() {
 #if defined(STRATA_EC_HIP_BAND)
     if (base_ != nullptr) (void) hipDeviceSynchronize();
-    const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
-    const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
-    for (int i = 0; i < 3; ++i)
-        if (band_h_[i] != 0 && base_ != nullptr) band_unmap(base_ + from[i], (size_t) (to[i] - from[i]), band_h_[i]);
-    if (base_ != nullptr && band_total_ > 0) (void) hipMemAddressFree(base_, (size_t) band_total_);
+    for (Part& pt : parts_) {
+        if (pt.mapped && pt.h != 0 && base_ != nullptr) band_unmap(base_ + pt.lo, (size_t) (pt.hi - pt.lo), pt.h);
+        if (pt.reserved && base_ != nullptr) (void) hipMemAddressFree(base_ + pt.lo, (size_t) (pt.hi - pt.lo));
+        pt.mapped = pt.reserved = false;
+    }
 #endif
-    band_h_[0] = band_h_[1] = band_h_[2] = 0;
-    band_mapped_ = false;
+    parts_.clear();
     band_total_ = 0;
     base_ = nullptr;
 }
 
-bool ExpertCache::band_release(std::string& err) {
+bool ExpertCache::band_mapped() const {
+    for (size_t j = 1; j + 1 < parts_.size(); ++j)
+        if (!parts_[j].mapped) return false;
+    return true;
+}
+int64_t ExpertCache::band_unmapped_slots() const {
+    int64_t n = 0;
+    for (size_t j = 1; j + 1 < parts_.size(); ++j)
+        if (!parts_[j].mapped) n += parts_[j].s1 - parts_[j].s0;
+    return n;
+}
+int64_t ExpertCache::band_unmapped_bytes() const {
+    int64_t n = 0;
+    for (size_t j = 1; j + 1 < parts_.size(); ++j)
+        if (!parts_[j].mapped) n += (int64_t) (parts_[j].hi - parts_[j].lo);
+    return n;
+}
+int64_t ExpertCache::band_bytes() const {
+    int64_t n = 0;
+    for (size_t j = 1; j + 1 < parts_.size(); ++j) n += (int64_t) (parts_[j].hi - parts_[j].lo);
+    return n;
+}
+
+bool ExpertCache::band_seg_release(int i, std::string& err) {
 #if defined(STRATA_EC_HIP_BAND)
-    if (band_n_ <= 0) { err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)"; return false; }
-    if (!band_mapped_) return true;
+    if (i < 0 || i >= band_segments()) { err = "no such band segment"; return false; }
+    Part& pt = parts_[(size_t) i + 1];
+    if (!pt.mapped) return true;
     if (hipDeviceSynchronize() != hipSuccess) {
-        err = std::string("the device failed before the band was released: ") + hipGetErrorString(hipGetLastError());
+        err = std::string("the device failed before a band segment was released: ") + hipGetErrorString(hipGetLastError());
         return false;
     }
-    if (!band_unmap(base_ + band_lo_, (size_t) band_size_, band_h_[1])) {
-        err = "the driver refused to release the expert cache's band";
+    if (!band_unmap(base_ + pt.lo, (size_t) (pt.hi - pt.lo), pt.h)) {
+        err = "the driver refused to release a segment of the expert cache's band";
         return false;
     }
-    band_h_[1] = 0;
-    band_mapped_ = false;
+    pt.h = 0;
+    pt.mapped = false;
+    // ROCm frees the physical memory only with its address range: free it, and hold the same addresses again (empty)
+    if (pt.reserved) (void) hipMemAddressFree(base_ + pt.lo, (size_t) (pt.hi - pt.lo));
+    pt.reserved = band_reserve_at(base_ + pt.lo, (size_t) (pt.hi - pt.lo));
+    if (!pt.reserved) {
+        pt.lost = true;
+        std::fprintf(stderr, "ExpertCache: band segment %d: its addresses could not be reserved again - it stays out\n", i);
+    }
     return true;
 #else
+    (void) i;
     err = "the band needs HIP";
     return false;
 #endif
 }
 
-bool ExpertCache::band_restore(std::string& err) {
+bool ExpertCache::band_seg_restore(int i, std::string& err) {
 #if defined(STRATA_EC_HIP_BAND)
-    if (band_n_ <= 0) { err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)"; return false; }
-    if (band_mapped_) return true;
+    if (i < 0 || i >= band_segments()) { err = "no such band segment"; return false; }
+    Part& pt = parts_[(size_t) i + 1];
+    if (pt.mapped) return true;
+    if (pt.lost || !pt.reserved) { err = "a band segment lost its addresses"; return false; }
     int dev = 0;
     (void) hipGetDevice(&dev);
-    if (!band_map(dev, base_ + band_lo_, (size_t) band_size_, band_h_[1])) {
-        err = "the driver has no VRAM for the expert cache's band now";
+    if (!band_map(dev, base_ + pt.lo, (size_t) (pt.hi - pt.lo), pt.h)) {
+        err = "the driver has no VRAM for a segment of the expert cache's band now";
         return false;
     }
-    band_mapped_ = true;
-    if (hipMemset(base_ + band_lo_, 0, (size_t) band_size_) != hipSuccess) {
+    pt.mapped = true;
+    if (hipMemset(base_ + pt.lo, 0, (size_t) (pt.hi - pt.lo)) != hipSuccess)
         (void) hipGetLastError();   // not fatal: every band slot is refilled before it is used
-    }
     return true;
 #else
+    (void) i;
     err = "the band needs HIP";
     return false;
 #endif
+}
+
+bool ExpertCache::band_release(std::string& err) {
+    for (int i = band_segments() - 1; i >= 0; --i)
+        if (!band_seg_release(i, err)) return false;
+    return band_n_ > 0 || (err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)", false);
+}
+
+bool ExpertCache::band_restore(std::string& err) {
+    for (int i = 0; i < band_segments(); ++i)
+        if (!band_seg_restore(i, err)) return false;
+    return band_n_ > 0 || (err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)", false);
 }
 
 bool ExpertCache::zero_all() {
     if (base_ == nullptr) return false;
-    if (band_n_ > 0 || band_layout_) {
-        const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
-        const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
+    if (!parts_.empty()) {
         bool ok = true;
-        for (int i = 0; i < 3; ++i)
-            if (to[i] > from[i] && band_h_[i] != 0)
-                ok = cudaMemset(base_ + from[i], 0, (size_t) (to[i] - from[i])) == cudaSuccess && ok;
+        for (const Part& pt : parts_)
+            if (pt.mapped && pt.hi > pt.lo)
+                ok = cudaMemset(base_ + pt.lo, 0, (size_t) (pt.hi - pt.lo)) == cudaSuccess && ok;
         return ok;
     }
     return cudaMemset(base_, 0, (size_t) bytes()) == cudaSuccess;
@@ -711,10 +788,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
     bool zeroed = false;
     if (band_layout_) {   // one memset per physical allocation (ROCm refuses one across them)
-        const uint64_t from[3] = {0, band_lo_, band_lo_ + band_size_}, to[3] = {band_lo_, band_lo_ + band_size_, band_total_};
         zeroed = true;
-        for (int i = 0; i < 3; ++i)
-            if (to[i] > from[i]) zeroed = cudaMemset(base_ + from[i], 0, (size_t) (to[i] - from[i])) == cudaSuccess && zeroed;
+        for (const Part& pt : parts_)
+            if (pt.mapped && pt.hi > pt.lo) zeroed = cudaMemset(base_ + pt.lo, 0, (size_t) (pt.hi - pt.lo)) == cudaSuccess && zeroed;
     } else {
         zeroed = cudaMemset(base_, 0, (size_t) want) == cudaSuccess;
     }
@@ -764,25 +840,44 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     if (want_band && g == 0)
         std::fprintf(stderr, "ExpertCache: the releasable band is off: this GPU or driver has no virtual memory "
                              "management\n");
+    // the band's boundaries in slots: its start, a cut each time a segment holds seg_bytes, its end
+    std::vector<int64_t> bcuts;
+    if (g > 0) {
+        bcuts.push_back(bf);
+        const uint64_t seg = band_req_seg_ > 0 ? (uint64_t) band_req_seg_ : ~0ull;
+        uint64_t acc = 0;
+        for (int64_t i = bf; i < be; ++i) {
+            acc += ((uint64_t) slot_bytes[(size_t) i] + 255) / 256 * 256;
+            if (acc >= seg && i + 1 < be) { bcuts.push_back(i + 1); acc = 0; }
+        }
+        bcuts.push_back(be);
+    }
     for (int pass = (g > 0 ? 0 : 1); pass < 2; ++pass) {
         const bool band = pass == 0;
         int64_t mx = 0;
         std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
+        size_t ci = 0;
         for (size_t i = 0; i < slot_bytes.size(); ++i) {
-            if (band && ((int64_t) i == bf || (int64_t) i == be)) off[i] = (off[i] + g - 1) / g * g;
+            if (band && ci < bcuts.size() && (int64_t) i == bcuts[ci]) { off[i] = (off[i] + g - 1) / g * g; ++ci; }
             // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
             off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
             mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
         }
         band_layout_ = band;
         band_gran_ = band ? g : 0;
-        band_lo_ = band ? off[(size_t) bf] : 0;
-        band_size_ = band ? off[(size_t) be] - off[(size_t) bf] : 0;
+        band_cut_.clear();
+        band_cut_slots_.clear();
+        if (band) {
+            band_cut_.push_back(0);
+            band_cut_slots_.push_back(0);
+            for (const int64_t c : bcuts) { band_cut_.push_back(off[(size_t) c]); band_cut_slots_.push_back(c); }
+            band_cut_.push_back(off.back());
+            band_cut_slots_.push_back(n_all);
+        }
         // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
         const bool ok = open((int64_t) off.back(), n_layers, n_expert, 1, err);
         band_layout_ = false;
         if (!ok) {
-            band_lo_ = band_size_ = 0;
             if (band && err.find("only") == std::string::npos) {   // not a plain "too little VRAM": try one allocation
                 std::fprintf(stderr, "ExpertCache: the releasable band could not be laid out (%s); one allocation "
                                      "instead\n", err.c_str());
@@ -825,7 +920,7 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (band_h_[0] != 0 || band_h_[1] != 0 || band_h_[2] != 0 || band_total_ > 0) {
+    if (!parts_.empty() || band_total_ > 0) {
         release_band();
         band_n_ = 0;
         band_first_ = 0;
