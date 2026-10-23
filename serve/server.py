@@ -156,6 +156,23 @@ LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reason
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
 
+def _trailing_reminder(messages):
+    """The text of a final user message that holds nothing but <system-reminder> blocks (None otherwise)."""
+    if os.environ.get("STRATA_TRAILING_REMINDER", "1") == "0" or not isinstance(messages, list) or len(messages) < 3:
+        return None
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return None
+    c = last.get("content")
+    if isinstance(c, list) and all(isinstance(x, dict) and x.get("type") == "text" for x in c):
+        c = "".join(x.get("text") or "" for x in c)
+    if not isinstance(c, str) or "<system-reminder>" not in c:
+        return None
+    if re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", c).strip():
+        return None
+    return c.strip()
+
+
 
 def reasoning_repeat_coverage(text):
     """Coverage of recent words by 12-word passages seen at least three times.
@@ -2942,7 +2959,14 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        # Oct 22 (local): a client's transient reminder as the LAST user message (Qwen Code appends a
+        # "<system-reminder>" memory catalog to every request and drops it from the next one) goes into the trailing
+        # system turn instead, so --tail-role-token checkpoints the conversation in front of it and the next turn
+        # reuses that checkpoint.  Off with STRATA_TRAILING_REMINDER=0.
+        reminder = _trailing_reminder(messages) if self.effort_end else None
+        if reminder is not None:
+            messages = messages[:-1]
+        if not self.effort_end or (reminder is None and not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
@@ -2950,7 +2974,14 @@ class Service:
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
             return full
-        tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        texts = []
+        if reminder is not None:
+            texts.append(reminder)
+        if not off and effort not in (None, "", "xhigh", "high"):
+            texts.append(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        tail = EFFORT_TURN.format("\n\n".join(texts)) if texts else ""
+        if reminder is not None and not texts[1:] and not (off or effort not in (None, "", "xhigh", "high")):
+            history = mine                             # default effort: the history exactly as a default request renders
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
