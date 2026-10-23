@@ -4878,6 +4878,26 @@ int main(int argc, char** argv) {
             const double l3_mb = l3 != nullptr ? std::atof(l3) : 0.0;
             const bool l3_stats = l3s != nullptr && std::atoi(l3s) != 0;
             if (l3_mb > 0 || l3_stats) {
+                // q5opt r6-mem: STRATA_L3_PF_THREADS=N prefetch threads (default 1), STRATA_L3_PF_CPU_ONLY=1 the
+                // predicted CPU share only (see RouterLookahead::set_l3_threads / set_l3_cpu_share)
+                if (const char* v = std::getenv("STRATA_L3_PF_THREADS"); v != nullptr && std::atoi(v) > 0) {
+                    // more than one: only on the helper CPUs - an unpinned extra prefetch thread waiting (MWAITX,
+                    // runnable) could be scheduled onto a pool worker's or the host's CPU and time-slice with it
+                    if (std::atoi(v) > 1 && strata::kernels::cpu::helper_cpus().empty())
+                        std::fprintf(stderr, "strata generate: STRATA_L3_PF_THREADS=%s needs STRATA_HELPER_CPUS (the extra "
+                                             "threads would float onto the pool's CPUs): one prefetch thread\n", v);
+                    else
+                        lookahead.set_l3_threads(std::atoi(v));
+                }
+                if (const char* v = std::getenv("STRATA_L3_PF_CPU_ONLY"); v != nullptr && std::atoi(v) != 0) {
+                    // with STRATA_PCIE_PICK the PCIe share is the UNPREDICTED misses, not the predicted list's tail:
+                    // cutting that tail would leave predicted CPU experts cold, so no cut then
+                    const char* pk = std::getenv("STRATA_PCIE_PICK");
+                    if (pk != nullptr && std::atoi(pk) != 0)
+                        std::fprintf(stderr, "strata generate: STRATA_L3_PF_CPU_ONLY ignored with STRATA_PCIE_PICK\n");
+                    else
+                        lookahead.set_l3_cpu_share(std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5))), true);
+                }
                 lookahead.start_l3_prefetch((size_t) (l3_mb * 1e6), l3_stats);
                 std::fprintf(stderr, "strata generate: L3 prefetch of the next layer's predicted experts: %.1f MB a layer%s\n",
                              l3_mb, l3_stats ? " (stats on)" : "");

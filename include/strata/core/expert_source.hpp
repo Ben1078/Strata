@@ -240,6 +240,17 @@ public:
     /// The dispatcher, for STRATA_L3_STATS: the experts the CPU computes in `layer` (and how many the GPU took over
     /// PCIe), against the prediction and what was prefetched.
     void note_cpu_experts(int64_t layer, const int32_t* experts, int n, int pcie);
+    /// q5opt r6-mem: the L3 prefetch on `threads` threads (STRATA_L3_PF_THREADS, default 1 = the single prefetch
+    /// thread): they share the next layer's predicted experts in 16 KB pieces, expert by expert in routing order, in
+    /// the same gap.  `pcie_num` (the verify window's PCIe share, /256) with `cpu_only` (STRATA_L3_PF_CPU_ONLY=1): the
+    /// predicted list is cut to its CPU share first (the last pcie_num/256 of it is what the GPU would read over PCIe,
+    /// which an L3 copy does not serve).  Call before start_l3_prefetch.  Only reads memory, as before.
+    void set_l3_threads(int threads) { pf_threads_ = threads < 1 ? 1 : threads > 8 ? 8 : threads; }
+    void set_l3_cpu_share(int pcie_num, bool cpu_only) { pf_pcie_num_ = pcie_num; pf_cpu_only_ = cpu_only; }
+    /// q5opt r6-mem, STRATA_PCIE_PICK=1: the experts the lookahead predicted for `layer` in the phase now running
+    /// (empty when none).  The dispatcher gives the GPU's PCIe share the UNPREDICTED misses first, so the CPU's share
+    /// is the experts the L3 prefetch read.
+    void predicted_for(int64_t layer, std::vector<int32_t>& out);
 
 private:
     /// The KB of `expert` the L3 prefetch read for the current phase (the stats).
@@ -250,7 +261,14 @@ private:
         return pf_kb_[(size_t) expert].load(std::memory_order_relaxed);
     }
     void run();
-    void prefetch_run();
+    void prefetch_run(int idx);
+    /// q5opt r6-mem: the next 16 KB piece of phase `gen` (of `total`), or SIZE_MAX when the phase is read or over.
+    size_t claim_piece(uint64_t gen, size_t total);
+    int pf_threads_ = 1;
+    int pf_pcie_num_ = 0;
+    bool pf_cpu_only_ = false;
+    std::vector<std::thread> pf_extra_;
+    alignas(64) std::atomic<uint64_t> pf_claim_{0};
     // the host thread's CPU phases, counted (cpu_begin increments): a prediction made in phase s is for phase s + 1
     int64_t seq_ = 0;
     alignas(64) std::atomic<int64_t> busy_seq_{0};

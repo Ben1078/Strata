@@ -1831,6 +1831,8 @@ RouterLookahead::~RouterLookahead() {
     pcv_.notify_all();
     busy_seq_.store(INT64_MAX / 2, std::memory_order_release);   // ends a prefetch or a wait for a phase
     if (pf_thread_.joinable()) pf_thread_.join();
+    for (std::thread& t : pf_extra_)
+        if (t.joinable()) t.join();
 }
 
 void RouterLookahead::start_l3_prefetch(size_t bytes_per_layer, bool stats) {
@@ -1840,7 +1842,37 @@ void RouterLookahead::start_l3_prefetch(size_t bytes_per_layer, bool stats) {
         pf_kb_.reset(new std::atomic<uint32_t>[(size_t) n_expert_]);
         for (int64_t e = 0; e < n_expert_; ++e) pf_kb_[(size_t) e].store(0, std::memory_order_relaxed);
     }
-    if (pf_budget_ > 0 && !pf_thread_.joinable()) pf_thread_ = std::thread([this] { prefetch_run(); });
+    if (pf_budget_ > 0 && !pf_thread_.joinable()) {
+        pf_thread_ = std::thread([this] { prefetch_run(0); });
+        for (int i = 1; i < pf_threads_; ++i) pf_extra_.emplace_back([this, i] { prefetch_run(i); });
+    }
+}
+
+void RouterLookahead::predicted_for(int64_t layer, std::vector<int32_t>& out) {
+    out.clear();
+    const int64_t seq = busy_seq_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(pmu_);
+    for (const PredRec& r : pred_hist_)
+        if (r.layer == layer && r.seq == seq) { out = r.list; return; }
+}
+
+size_t RouterLookahead::claim_piece(uint64_t gen, size_t total) {
+    const uint64_t g = gen & 0xffffffffull;
+    uint64_t cur = pf_claim_.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t cg = cur >> 32;
+        if (cg != g) {
+            if (((g - cg) & 0xffffffffull) > 0x7fffffffull) return SIZE_MAX;   // a newer phase has started: this one is over
+            // the first thread of this phase: piece 0 is its own
+            if (pf_claim_.compare_exchange_weak(cur, (g << 32) | 1ull, std::memory_order_acq_rel, std::memory_order_acquire))
+                return total > 0 ? 0 : SIZE_MAX;
+            continue;
+        }
+        const uint64_t i = cur & 0xffffffffull;
+        if (i >= total) return SIZE_MAX;
+        if (pf_claim_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+            return (size_t) i;
+    }
 }
 
 void RouterLookahead::cpu_begin(int64_t layer) {
@@ -1896,19 +1928,27 @@ inline uint64_t touch_lines(const uint8_t* p, size_t n) {
 }
 }  // namespace
 
-void RouterLookahead::prefetch_run() {
+void RouterLookahead::prefetch_run(int idx) {
+    // q5opt r6-mem: STRATA_HELPER_CPUS: each prefetch thread on its own CPU (STRATA_L3_PF_CPUS, else the last ones)
+    (void) strata::kernels::cpu::helper_thread_affinity(idx);
+    // one thread and no CPU-share cut: the original loop, unchanged (production's STRATA_L3_PREFETCH=64 path)
+    const bool legacy = pf_threads_ == 1 && !(pf_cpu_only_ && pf_pcie_num_ > 0);
     uint64_t seen = 0;
     std::vector<int32_t> list, prev;
+    std::vector<const uint8_t*> ptrs;
     volatile uint64_t sink = 0;
     const bool mw = mwaitx_ok();
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    constexpr size_t kChunk = 16384;
     for (;;) {
         int64_t layer, seq;
+        uint64_t gen;
         {
             std::unique_lock<std::mutex> lk(pmu_);
             pcv_.wait(lk, [&] { return pf_quit_ || pred_gen_ != seen; });
             if (pf_quit_) return;
             seen = pred_gen_;
+            gen = seen;
             layer = pred_layer_;
             seq = pred_seq_;
             list = pred_;
@@ -1927,30 +1967,59 @@ void RouterLookahead::prefetch_run() {
             }
         }
         if (late || busy_seq_.load(std::memory_order_acquire) >= seq) continue;
-        // the progress table (the stats): the previous target's entries cleared, then tagged with this one
-        pf_tag_seq_.store(-1, std::memory_order_release);
-        for (int32_t e : prev)
-            if (e >= 0 && e < (int32_t) n_expert_) pf_kb_[(size_t) e].store(0, std::memory_order_relaxed);
-        pf_tag_layer_.store(layer, std::memory_order_relaxed);
-        pf_tag_seq_.store(seq, std::memory_order_release);
-        prev = list;
-        // the list in routing order (token 0's experts first: the CPU's share), 16 KB at a time, until the budget is
-        // read or the layer's CPU work begins
+        if (pf_cpu_only_ && pf_pcie_num_ > 0) {   // STRATA_L3_PF_CPU_ONLY: the predicted CPU share only
+            const size_t m = (list.size() * (size_t) pf_pcie_num_) >> 8;
+            list.resize(list.size() - m);
+        }
+        if (idx == 0) {
+            // the progress table (the stats): the previous target's entries cleared, then tagged with this one
+            pf_tag_seq_.store(-1, std::memory_order_release);
+            for (int32_t e : prev)
+                if (e >= 0 && e < (int32_t) n_expert_) pf_kb_[(size_t) e].store(0, std::memory_order_relaxed);
+            pf_tag_layer_.store(layer, std::memory_order_relaxed);
+            pf_tag_seq_.store(seq, std::memory_order_release);
+            prev = list;
+        } else if (pf_stats_) {
+            // the first thread clears the previous phase's counts first (stats only): a moment for it
+            for (int s = 0; s < 4000 && pf_tag_seq_.load(std::memory_order_acquire) != seq &&
+                            busy_seq_.load(std::memory_order_relaxed) < seq; ++s) _mm_pause();
+        }
         const size_t bytes = (size_t) lay.blob_bytes(layer);
-        constexpr size_t kChunk = 16384;
-        size_t left = pf_budget_;
-        for (int32_t e : list) {
-            const uint8_t* p = e >= 0 && e < (int32_t) n_expert_ ? src_->resident_ptr(layer, e) : nullptr;
-            if (p == nullptr) continue;
-            size_t o = 0;
-            while (o < bytes && left > 0 && busy_seq_.load(std::memory_order_relaxed) < seq) {
-                const size_t n = std::min({kChunk, bytes - o, left});
-                sink = sink + touch_lines(p + o, n);
-                o += n;
-                left -= n;
-                pf_kb_[(size_t) e].store((uint32_t) (o >> 10), std::memory_order_relaxed);
+        if (legacy) {
+            // the list in routing order (token 0's experts first: the CPU's share), 16 KB at a time, until the budget is
+            // read or the layer's CPU work begins (the round-1 loop, as deployed)
+            size_t left = pf_budget_;
+            for (int32_t e : list) {
+                const uint8_t* p = e >= 0 && e < (int32_t) n_expert_ ? src_->resident_ptr(layer, e) : nullptr;
+                if (p == nullptr) continue;
+                size_t o = 0;
+                while (o < bytes && left > 0 && busy_seq_.load(std::memory_order_relaxed) < seq) {
+                    const size_t n = std::min({kChunk, bytes - o, left});
+                    sink = sink + touch_lines(p + o, n);
+                    o += n;
+                    left -= n;
+                    pf_kb_[(size_t) e].store((uint32_t) (o >> 10), std::memory_order_relaxed);
+                }
+                if (left == 0 || busy_seq_.load(std::memory_order_relaxed) >= seq) break;
             }
-            if (left == 0 || busy_seq_.load(std::memory_order_relaxed) >= seq) break;
+            continue;
+        }
+        // the list in routing order (token 0's experts first: the CPU's share), 16 KB at a time, shared by the
+        // prefetch threads (expert by expert), until the budget is read or the layer's CPU work begins
+        const size_t per = (bytes + kChunk - 1) / kChunk;
+        ptrs.clear();
+        for (int32_t e : list) ptrs.push_back(e >= 0 && e < (int32_t) n_expert_ ? src_->resident_ptr(layer, e) : nullptr);
+        const size_t total = std::min(ptrs.size() * per, (pf_budget_ + kChunk - 1) / kChunk);
+        for (;;) {
+            if (busy_seq_.load(std::memory_order_relaxed) >= seq) break;
+            const size_t c = claim_piece(gen, total);
+            if (c == SIZE_MAX) break;
+            const size_t ei = c / per, o = (c % per) * kChunk;
+            const uint8_t* p = ptrs[ei];
+            if (p == nullptr) continue;
+            const size_t n = std::min(kChunk, bytes - o);
+            sink = sink + touch_lines(p + o, n);
+            pf_kb_[(size_t) list[ei]].fetch_add((uint32_t) (n >> 10), std::memory_order_relaxed);
         }
     }
 }
@@ -2055,7 +2124,13 @@ void RouterLookahead::run() {
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
         // AVX-only Xeon E5-2687W died here (vpmovzxwd) on its first request.  An estimate only (which experts to
         // prefetch); the order of the additions differs between the three, the output does not depend on it.
-        if (strata::kernels::cpu::cpu_avx2_ok()) {
+        // q5opt r6-mem STRATA_LOOKAHEAD_BF16=1: vdpbf16ps (Zen 4) - a prediction only, ~3x less compute
+        static const bool la_bf16 = [] { const char* v = std::getenv("STRATA_LOOKAHEAD_BF16"); return v != nullptr && std::atoi(v) != 0; }() &&
+                                    strata::kernels::cpu::cpu_avx512bf16_ok() && n_embd_ % 32 == 0;
+        if (la_bf16) {
+            strata::kernels::cpu::bf16_rows_dot_multi_avx512bf16(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
+                                                                 x_.data(), (int) nt, logits.data());
+        } else if (strata::kernels::cpu::cpu_avx2_ok()) {
             strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
                                                       x_.data(), (int) nt, logits.data());
         } else if (strata::kernels::cpu::cpu_avx1_ok()) {
@@ -2105,7 +2180,7 @@ void RouterLookahead::run() {
                 r.list = pred_;
                 ++pred_gen_;
             }
-            pcv_.notify_one();
+            pcv_.notify_all();
         }
         }
         busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
