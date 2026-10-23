@@ -1448,16 +1448,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
             stamp(l, 19, grp);
+            // q5opt r6-mem, STRATA_PCIE_FIRST=1 (default off; the copy-kernel PCIe mode only): the PCIe share's copy
+            // (the GPU reading the RAM copy over PCIe, beside the CPU's own share) is started BEFORE the VRAM groups
+            // instead of after them, so the PCIe side of the layer ends ~0.08 ms sooner and a larger --pcie-frac can
+            // balance it.  The pool publishes the whole plan (flagA) and then flagB at once, so nothing waits longer.
+            // The same kernels on the same inputs, only in another order: the same results.
+            static const bool pcie_first = [] { const char* v = std::getenv("STRATA_PCIE_FIRST"); return v != nullptr && std::atoi(v) != 0; }();
+            const bool pf_early = pcie_first && sink_.pcie_mode == 2 && !device_plan_;
+            auto stage_pcie = [&]() {
+                if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+                if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+                }
+            };
+            if (pf_early) stage_pcie();
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-            }
+            if (!pf_early) stage_pcie();
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them

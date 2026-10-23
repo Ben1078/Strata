@@ -3319,6 +3319,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        // q5opt r6-mem, STRATA_PCIE_PICK=1 (default off; a placement change, like --pcie-frac): the GPU's PCIe share is
+        // taken from the misses the router lookahead did NOT predict (the last ones in routing order first), then from
+        // the predicted ones (last first), so the CPU computes the experts the L3 prefetch read into the cache.  The
+        // same number of experts goes over PCIe; only which ones.  Without a prediction for this layer: as before.
+        static const bool pcie_pick = [] { const char* v = std::getenv("STRATA_PCIE_PICK"); return v != nullptr && std::atoi(v) != 0; }();
+        bool use_pick = false;
+        bool want_pcie[kMaxWindowEntries];
+        if (pcie_pick && m > 0 && d.lookahead != nullptr) {
+            static thread_local std::vector<int32_t> pl;
+            d.lookahead->predicted_for(d.layers, pl);
+            if (!pl.empty()) {
+                int unpred[kMaxWindowEntries], pred[kMaxWindowEntries], nu = 0, np = 0;
+                for (int q = 0; q < nd; ++q) {
+                    want_pcie[q] = false;
+                    const int32_t e = ids[distinct[q]];
+                    if (e < 0 || e >= d.n_expert ||
+                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0 ||
+                        (d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e)) continue;
+                    if (std::find(pl.begin(), pl.end(), e) != pl.end()) pred[np++] = q;
+                    else unpred[nu++] = q;
+                }
+                int left = m;
+                for (int i = nu - 1; i >= 0 && left > 0; --i, --left) want_pcie[unpred[i]] = true;
+                for (int i = np - 1; i >= 0 && left > 0; --i, --left) want_pcie[pred[i]] = true;
+                use_pick = true;
+            }
+        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -3339,7 +3366,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
                 } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    if ((use_pick ? want_pcie[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;

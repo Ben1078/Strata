@@ -1397,6 +1397,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # q5opt r6-mem: the CPU expert pool, the DRAM and the PCIe tier in isolation (bandwidth, contention, gap prefetch)
+    add_executable(r6mem_bench src/kernels/r6mem_bench.cpp)
+    target_include_directories(r6mem_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(r6mem_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    set_source_files_properties(src/kernels/r6mem_bench.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx2;-mfma;-mf16c")
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
       # Unsloth UD-Q4_K_XL's three expert pairs (and Q8_0 alone, its embedding) on synthetic ggml-quantized weights
       # at 2560/640: GPU and CPU experts against the float reference, GPU dequantizers against to_float.
