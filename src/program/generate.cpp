@@ -4871,6 +4871,16 @@ int main(int argc, char** argv) {
             else if (src.io_prefetch())
                 lookahead.set_depth(2);
             std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+            // the L3 prefetch of the next layer's predicted RAM-copy experts (RouterLookahead::start_l3_prefetch)
+            const char* l3 = std::getenv("STRATA_L3_PREFETCH");
+            const char* l3s = std::getenv("STRATA_L3_STATS");
+            const double l3_mb = l3 != nullptr ? std::atof(l3) : 0.0;
+            const bool l3_stats = l3s != nullptr && std::atoi(l3s) != 0;
+            if (l3_mb > 0 || l3_stats) {
+                lookahead.start_l3_prefetch((size_t) (l3_mb * 1e6), l3_stats);
+                std::fprintf(stderr, "strata generate: L3 prefetch of the next layer's predicted experts: %.1f MB a layer%s\n",
+                             l3_mb, l3_stats ? " (stats on)" : "");
+            }
         } else {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",

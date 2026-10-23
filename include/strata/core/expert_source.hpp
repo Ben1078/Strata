@@ -193,6 +193,9 @@ public:
     virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
+    /// The blob's address in the RAM copy (resident for the source's life, never recycled), or null: what the L3
+    /// prefetch of predicted experts reads (RouterLookahead).  Counts nothing, changes nothing.
+    virtual const uint8_t* resident_ptr(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
 protected:
     /// What model_inputs() returns; set by a source's open().
     void record_inputs(const std::string& pack_experts, const std::string& gguf,
@@ -225,8 +228,54 @@ public:
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
 
+    /// L3 prefetch (STRATA_L3_PREFETCH=<MB per layer>, 0 = off): between two layers the CPU waits for the GPU (~0.3 ms
+    /// a layer, the RAM idle), so a second thread reads the next layer's PREDICTED experts that the RAM copy holds
+    /// into the CPU's caches (96 MiB of L3 on a 7800X3D) until the layer's CPU work starts: those rows then stream from
+    /// the L3 instead of the RAM.  Only reads memory: which experts are computed, and how, never depends on it.
+    /// STRATA_L3_STATS=1 prints the predictor's hit rate and the prefetch's useful bytes every 4,800 layers.
+    void start_l3_prefetch(size_t bytes_per_layer, bool stats);
+    /// The dispatcher: a layer's CPU work begins (a prefetch for it stops) / ends (the next layer's may start).
+    void cpu_begin(int64_t layer);
+    void cpu_end(int64_t layer);
+    /// The dispatcher, for STRATA_L3_STATS: the experts the CPU computes in `layer` (and how many the GPU took over
+    /// PCIe), against the prediction and what was prefetched.
+    void note_cpu_experts(int64_t layer, const int32_t* experts, int n, int pcie);
+
 private:
+    /// The KB of `expert` the L3 prefetch read for the current phase (the stats).
+    uint32_t prefetched_kb(int64_t layer, int32_t expert) const {
+        if (pf_kb_ == nullptr || expert < 0 || expert >= (int32_t) n_expert_ ||
+            pf_tag_seq_.load(std::memory_order_acquire) != busy_seq_.load(std::memory_order_relaxed) ||
+            pf_tag_layer_.load(std::memory_order_relaxed) != layer) return 0;
+        return pf_kb_[(size_t) expert].load(std::memory_order_relaxed);
+    }
     void run();
+    void prefetch_run();
+    // the host thread's CPU phases, counted (cpu_begin increments): a prediction made in phase s is for phase s + 1
+    int64_t seq_ = 0;
+    alignas(64) std::atomic<int64_t> busy_seq_{0};
+    alignas(64) std::atomic<int64_t> done_seq_{0};   // its own line: the prefetch thread waits on it (MWAITX)
+    int64_t submit_seq_ = 0;          // under mu_: the phase whose input the pending prediction uses
+    // the prediction for the next layer, run() -> prefetch_run()
+    std::mutex pmu_;
+    std::condition_variable pcv_;
+    bool pf_quit_ = false;
+    uint64_t pred_gen_ = 0;
+    int64_t pred_layer_ = -1, pred_seq_ = -1;
+    std::vector<int32_t> pred_;
+    // the last predictions, for the stats (the next one replaces pred_ while its layer still runs)
+    struct PredRec { int64_t layer = -1, seq = -1; std::vector<int32_t> list; };
+    PredRec pred_hist_[4];
+
+    std::thread pf_thread_;
+    // what the prefetcher has read so far for its current target (phase pf_tag_seq_, layer pf_tag_layer_), per expert
+    std::unique_ptr<std::atomic<uint32_t>[]> pf_kb_;
+    std::atomic<int64_t> pf_tag_seq_{-1}, pf_tag_layer_{-1};
+    size_t pf_budget_ = 0;
+    bool pf_stats_ = false;
+    // stats (dispatcher thread only)
+    int64_t st_layers_ = 0, st_cpu_ = 0, st_pred_ = 0, st_hit_ = 0, st_pcie_ = 0, st_nopred_ = 0;
+    uint64_t st_pf_bytes_ = 0, st_pf_used_ = 0;
     std::vector<std::vector<uint16_t>> routers_;
     int64_t n_embd_ = 0, n_expert_ = 0;
     int k_ = 10;
@@ -539,6 +588,7 @@ public:
     int64_t commit_flip();
     /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
+    const uint8_t* resident_ptr(int64_t layer, int64_t expert) const override { return resident_blob(layer, expert); }
     int64_t exchanges() const { return exchanges_; }
     bool exchange_rotation() const { return exchange_storage_.active(); }
     uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
