@@ -1717,6 +1717,11 @@ class Vision:
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
 
+    # vision on demand (set per instance in __init__; class defaults for objects built without it, as tests do)
+    on_demand = None
+    last_used = 0.0
+    on_gpu = False
+
     @staticmethod
     def work_dir() -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
@@ -1754,6 +1759,11 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        # r7 (q5opt) vision on demand: a callable the Service sets ("start" -> True: the GPU may be used); the encoder
+        # is then started by the first image that is not cached, and stopped again when idle (Service._vision_reap)
+        self.on_demand = None
+        self.last_used = 0.0
+        self.on_gpu = False
         if not lazy:
             self._start()
 
@@ -1779,6 +1789,32 @@ class Vision:
                 pass
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.stopped = False
+
+    def _start_on_demand(self):
+        """r7: start the encoder for an image (the caller holds the Service's FIFO and self.lock).  The Service first
+        asks the engine to give back its releasable band; when it cannot (or the GPU encoder fails to start), the
+        encoder runs on the CPU for this time - slower, but the picture is read."""
+        args, log, env = self.spawn
+        use_gpu = "--gpu" in args and bool(self.on_demand("start"))
+        tries = [True, False] if use_gpu else [False]
+        last = None
+        for gpu in tries:
+            a = list(args) if gpu else [x for x in args if x != "--gpu"]
+            self.spawn = (a, log, env)
+            t0 = time.time()
+            try:
+                self.restart()
+                self.on_gpu = gpu
+                print(f"[strata] vision on demand: the encoder started on the {'GPU' if gpu else 'CPU'} in "
+                      f"{time.time() - t0:.1f} s", flush=True)
+                return
+            except RuntimeError as e:
+                last = e
+                print(f"[strata] vision on demand: the encoder did not start on the {'GPU' if gpu else 'CPU'}: {e}",
+                      flush=True)
+            finally:
+                self.spawn = (args, log, env)
+        raise ValueError(f"the vision encoder did not start: {last}")
 
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
@@ -1920,9 +1956,12 @@ class Vision:
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
+            self.last_used = time.time()
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
+            if self.on_demand is not None and not self.alive():       # r7: vision on demand
+                self._start_on_demand()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -1939,6 +1978,7 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
+            self.last_used = time.time()
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
@@ -2431,6 +2471,8 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.vision_od = None                         # r7 (q5opt): the config's "vision_on_demand" (dict) or None
+        self.vision_shrunk = False                    # r7: the engine gave its band back for the encoder
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -2578,7 +2620,79 @@ class Service:
         return value if value > 0 else None
 
     def _vision_down(self) -> bool:
+        if self.vision_od is not None:                # r7: on demand, a stopped encoder is the normal state
+            return False
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+
+    # ---- r7 (q5opt): vision on demand.  The engine starts alone and sizes its expert cache with the encoder's VRAM
+    # (STRATA_VRAM_BAND_MIB: part of it is a releasable band).  An image that is not cached: the engine gives the band
+    # back (`VRAM <reserve_mib>`, between requests - the encoder runs under the FIFO), the encoder starts on the GPU,
+    # and once it has been idle for idle_s it is stopped and the engine takes the band again (bare `VRAM`).
+    def _vision_room(self, what: str) -> bool:
+        """Called by Vision._start_on_demand with the FIFO held.  True: the GPU encoder has room."""
+        od, eng = self.vision_od or {}, self.engine
+        if not (hasattr(eng, "alive") and eng.alive()):
+            return True                               # no engine on the GPU: nothing to make room in
+        if not (getattr(eng, "info", {}) or {}).get("vram_elastic") or not hasattr(eng, "vram"):
+            print("[strata] vision on demand: this engine cannot give VRAM back (no band): the encoder runs on the "
+                  "CPU", flush=True)
+            return False
+        try:
+            out = eng.vram(int(od.get("reserve_mib", 2300)))
+        except (ValueError, EngineDied) as e:
+            print(f"[strata] vision on demand: the engine did not give VRAM back ({e}): the encoder runs on the CPU",
+                  flush=True)
+            return False
+        free = int(out.get("vram_free_mib") or 0)
+        self.vision_shrunk = self.vision_shrunk or int(out.get("band_mapped", 1)) == 0
+        print(f"[strata] vision on demand: {free} MiB of VRAM free for the encoder (expert cache "
+              f"{out.get('expert_slots')} of {out.get('expert_slots_full')} slots)", flush=True)
+        if free < int(od.get("need_mib", 1600)):
+            print(f"[strata] vision on demand: less than need_mib={od.get('need_mib', 1600)} MiB free: the encoder "
+                  "runs on the CPU", flush=True)
+            return False
+        return True
+
+    def _vision_reap(self):
+        """The reaper's tick: stop an idle encoder, then let the engine take its band again."""
+        v, od = self.vision, self.vision_od or {}
+        if v is None:
+            return
+        stop = v.alive() and time.time() - v.last_used >= float(od.get("idle_s", 300))
+        if not stop and not (self.vision_shrunk and not v.alive()):
+            return
+        if not self.fifo.acquire(blocking=False):
+            return
+        try:
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return
+            if stop:
+                v.close()
+                print(f"[strata] vision on demand: the encoder stopped after {od.get('idle_s', 300)} s idle", flush=True)
+                time.sleep(1.0)                       # the driver takes the encoder's VRAM back
+            if self.vision_shrunk and not v.alive() and hasattr(self.engine, "alive") and self.engine.alive():
+                out = self.engine.vram(None)
+                if int(out.get("band_mapped", 1)) == 1:
+                    self.vision_shrunk = False
+                print(f"[strata] vision on demand: expert cache {out.get('expert_slots')} of "
+                      f"{out.get('expert_slots_full')} slots, {out.get('vram_free_mib')} MiB free", flush=True)
+            elif self.vision_shrunk and not (hasattr(self.engine, "alive") and self.engine.alive()):
+                self.vision_shrunk = False            # the engine ended: a new one starts with its band
+        except (ValueError, EngineDied) as e:
+            print(f"[strata] vision on demand: the band was not taken back ({e}); trying again later", flush=True)
+        finally:
+            self.fifo.release()
+
+    def start_vision_reaper(self):
+        def loop():
+            while True:
+                time.sleep(5.0)
+                try:
+                    self._vision_reap()
+                except Exception as e:  # noqa: BLE001 - the thread keeps running
+                    print(f"[strata] vision on demand: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -5432,6 +5546,15 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        # r7 (q5opt): "vision_on_demand": {"band_mib": 1792, "reserve_mib": 2300, "need_mib": 1600, "idle_s": 300}
+        vision_od = None
+        if cfg.get("vision") and isinstance(cfg.get("vision_on_demand"), dict) and \
+                cfg["vision_on_demand"].get("enabled", True) is not False:
+            vision_od = {"band_mib": 1792, "reserve_mib": 2300, "need_mib": 1600, "idle_s": 300,
+                         **cfg["vision_on_demand"]}
+            env.setdefault("STRATA_VRAM_BAND_MIB", str(int(vision_od["band_mib"])))
+            print(f"[strata] vision on demand: the encoder starts with the first new image (band "
+                  f"{env['STRATA_VRAM_BAND_MIB']} MiB, stops after {vision_od['idle_s']} s idle)", flush=True)
         if cfg.get("vision"):
             print("loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -5440,7 +5563,7 @@ def main() -> int:
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+                            env=vision_env(cfg, env), lazy=lazy or vision_od is not None)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -5482,6 +5605,10 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if a.engine == "strata" and vision is not None and vision_od is not None:   # r7: vision on demand
+        svc.vision_od = vision_od
+        vision.on_demand = svc._vision_room
+        svc.start_vision_reaper()
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default

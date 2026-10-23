@@ -4469,6 +4469,29 @@ int main(int argc, char** argv) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
+                // r7 (q5opt): STRATA_VRAM_BAND_MIB=N - a releasable band of ~N MiB of slots (VRAM <reserve> gives it
+                // back to the vision encoder and takes it again; see ExpertCache::set_band).  It starts at
+                // STRATA_VRAM_BAND_AT percent of the slots (default 20), well below the prompt path's loan (the last
+                // slots).  One GPU, --serve, a native pack's sized slots, no --vram-elastic; HIP only.
+                static const int64_t band_mib = [] {
+                    const char* v = std::getenv("STRATA_VRAM_BAND_MIB");
+                    return v ? (int64_t) std::atoll(v) : (int64_t) 0;
+                }();
+                if (band_mib > 0 && o.serve && !multi_gpu && !o.vram_elastic && !sized_slots.empty() && o.batch == 0 &&
+                    o.peer_device < 0) {
+                    static const int64_t band_at = [] {
+                        const char* v = std::getenv("STRATA_VRAM_BAND_AT");
+                        return v ? std::max<int64_t>(1, std::min<int64_t>(60, std::atoll(v))) : (int64_t) 20;
+                    }();
+                    const int64_t n_all = (int64_t) sized_slots.size();
+                    const int64_t first = std::max<int64_t>(1, n_all * band_at / 100);
+                    int64_t n = 0, b = 0;
+                    while (first + n < n_all - 1 && b < (band_mib << 20)) b += (sized_slots[(size_t) (first + n++)] + 255) / 256 * 256;
+                    xcache.set_band(first, n);
+                } else if (band_mib > 0 && attempt == 0) {
+                    std::fprintf(stderr, "strata generate: STRATA_VRAM_BAND_MIB is off here (one GPU, --serve, a native "
+                                         "pack, no --vram-elastic / --batch / --peer-device)\n");
+                }
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
@@ -4500,7 +4523,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (!auto_cache || attempt - failed >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            xcache.zero_all();   // r7: one memset per physical allocation in band mode
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
@@ -4525,6 +4548,11 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        if (xcache.band_on())
+            std::fprintf(stderr, "strata generate: releasable band (STRATA_VRAM_BAND_MIB): slots %lld..%lld, %lld MiB "
+                                 "in its own allocation - VRAM <reserve_mib> gives it back, VRAM takes it again\n",
+                         (long long) xcache.band_first(), (long long) xcache.band_end() - 1,
+                         (long long) (xcache.band_bytes() >> 20));
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -7936,7 +7964,7 @@ int main(int argc, char** argv) {
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token, xcache.segmented() || xcache.band_on() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0)).c_str() : "");
         }
@@ -8014,12 +8042,120 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
+        // ---- r7 (q5opt): VRAM <reserve_mib> with the releasable band (STRATA_VRAM_BAND_MIB).  All or nothing: when
+        // less than reserve_mib is free, every expert in the band's slots becomes a miss (the CPU computes it from RAM,
+        // or from the model files when the RAM copy does not hold it - it was in VRAM) and the band's VRAM goes back
+        // to the driver; a bare `VRAM` (or a reserve that still fits with the band mapped) maps it again and refills
+        // each slot with the expert it held (or, when the adaptive tier brought that one back meanwhile, the layer's
+        // most-routed miss).  The prompt path's loan never reaches the band (refused if it would).
+        auto vram_band = [&](long long reserve, bool bare, std::string& e) -> bool {
+            for (const PfPart& p : pf_parts) {
+                if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
+                if (p.first >= 0 && p.first < xcache.band_end()) {
+                    e = "VRAM: the prompt path's loan reaches the band (a smaller STRATA_VRAM_BAND_AT)";
+                    return false;
+                }
+            }
+            if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
+            if (!ver.wait_commit(e)) return false;
+            if (!adapt_tick(true)) { e = "VRAM: the adaptive tier's copy failed"; return false; }
+            apply_pending(true);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            const auto t0 = Clock::now();
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const int64_t want_free = (int64_t) reserve << 20, band_b = xcache.band_bytes();
+            const int64_t b0 = xcache.band_first(), b1 = xcache.band_end();
+            const int64_t before = xcache.slots() - (xcache.band_mapped() ? 0 : xcache.band_slots());
+            // a bare VRAM restores the band while ~320 MiB stay free beside it (the start's own reserve was spent on
+            // the verify windows and the drafter after the cache was sized)
+            static const int64_t floor_b = [] {
+                const char* v = std::getenv("STRATA_VRAM_BAND_FLOOR_MIB");
+                return (v ? (int64_t) std::atoll(v) : (int64_t) 320) << 20;
+            }();
+            std::string note;
+            if (xcache.band_mapped() && !bare && (int64_t) free_b < want_free) {
+                int64_t moved = 0;
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= b0 && host_res[i] < b1) {
+                        vram_evicted.emplace_back((int32_t) i, host_res[i]);
+                        host_res[i] = strata::core::kNotResident;
+                        ++moved;
+                    }
+                res_upload();
+                if (cudaDeviceSynchronize() != cudaSuccess || !xcache.band_release(e)) {
+                    if (e.empty()) e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                // the evicted experts the RAM copy does not hold are read from the model files now: ask the OS for
+                // their pages while the encoder starts (64 pairs per call, as the profile fill does)
+                std::vector<std::pair<int32_t, int32_t>> adv;
+                for (const auto& [i, slot] : vram_evicted)
+                    if (slot >= b0 && slot < b1) adv.emplace_back((int32_t) (i / g.n_expert), (int32_t) (i % g.n_expert));
+                for (size_t k = 0; k < adv.size(); k += 64)
+                    (void) srcp->advise_pairs(adv.data() + k, (int64_t) std::min<size_t>(64, adv.size() - k));
+                note = " (band released: " + std::to_string(moved) + " experts now misses)";
+            } else if (!xcache.band_mapped() && (int64_t) free_b - band_b >= (bare ? floor_b : want_free)) {
+                if (!xcache.band_restore(e)) return false;
+                std::string ferr;
+                std::vector<std::pair<int32_t, int32_t>> keep_out;
+                int64_t refilled = 0;
+                for (const auto& [i, slot] : vram_evicted) {
+                    if (slot < b0 || slot >= b1) { keep_out.emplace_back(i, slot); continue; }
+                    const int64_t layer = i / g.n_expert;
+                    int64_t pick = i;
+                    if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
+                        pick = -1;
+                        float best = -1.0f;
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const size_t j = (size_t) (layer * g.n_expert + ex);
+                            if (host_res[j] >= 0) continue;
+                            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[j];
+                            if (u > best) { best = u; pick = (int64_t) j; }
+                        }
+                    }
+                    if (pick < 0) continue;
+                    const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
+                    if (b == nullptr || !xcache.fill_slot_blocking(slot, b, ferr,
+                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                        e = "VRAM: refilling the band failed: " + ferr;
+                        res_upload();
+                        return false;
+                    }
+                    host_res[(size_t) pick] = slot;
+                    ++refilled;
+                }
+                vram_evicted.swap(keep_out);
+                res_upload();
+                note = " (band restored: " + std::to_string(refilled) + " experts back)";
+            } else if (!xcache.band_mapped()) {
+                note = " (the band stays released: too little VRAM free for it)";
+            }
+            cudaMemGetInfo(&free_b, &total_b);
+            const int64_t live = xcache.slots() - (xcache.band_mapped() ? 0 : xcache.band_slots());
+            std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
+                                 "(%.2f of %.2f GiB), %lld MiB free now, in %.0f ms%s\n",
+                         reserve, (long long) before, (long long) live, (long long) xcache.full_slots(),
+                         (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
+                         (long long) (free_b >> 20),
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
+            std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld band_mapped=%d\n", reserve,
+                        (long long) live, (long long) xcache.full_slots(),
+                        (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
+                        (long long) (free_b >> 20), (long long) o.prefill_chunk, xcache.band_mapped() ? 1 : 0);
+            return true;
+        };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
             char* end = nullptr;
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+            if (xcache.band_on()) return vram_band(reserve, bare, e);
             if (!xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;

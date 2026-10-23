@@ -365,7 +365,8 @@ void ExpertCache::release_segmented() {
 }
 
 int64_t ExpertCache::mapped_bytes() const {
-    if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
+    if (segs_.empty())
+        return base_ != nullptr ? full_bytes() - (band_n_ > 0 && !band_mapped_ ? (int64_t) band_size_ : 0) : 0;
     int64_t b = 0;
     for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
     return b;
@@ -444,6 +445,186 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 #endif
 }
 
+
+// ---- r7 (q5opt): the releasable band (set_band), HIP's virtual memory management.  Three physical allocations in
+// one reserved address range: the slots before the band, the band, the slots after it.  Each runtime copy into the
+// arena is one slot (never across two allocations: the band's ends are granularity-aligned slot boundaries).
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+#define STRATA_EC_HIP_BAND 1
+namespace {
+hipMemAllocationProp band_prop(int dev) {
+    hipMemAllocationProp p{};
+    p.type = hipMemAllocationTypePinned;
+    p.location.type = hipMemLocationTypeDevice;
+    p.location.id = dev;
+    return p;
+}
+uint64_t band_granularity() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return 0;
+    const hipMemAllocationProp prop = band_prop(dev);
+    size_t g = 0;
+    if (hipMemGetAllocationGranularity(&g, &prop, hipMemAllocationGranularityRecommended) != hipSuccess || g == 0) {
+        (void) hipGetLastError();
+        return 0;
+    }
+    return (uint64_t) g;
+}
+bool band_map(int dev, uint8_t* va, size_t bytes, unsigned long long& handle) {
+    const hipMemAllocationProp prop = band_prop(dev);
+    hipMemGenericAllocationHandle_t h{};
+    if (hipMemCreate(&h, bytes, &prop, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    if (hipMemMap(va, bytes, 0, h, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        (void) hipMemRelease(h);
+        return false;
+    }
+    hipMemAccessDesc a{};
+    a.location.type = hipMemLocationTypeDevice;
+    a.location.id = dev;
+    a.flags = hipMemAccessFlagsProtReadWrite;
+    if (hipMemSetAccess(va, bytes, &a, 1) != hipSuccess) {
+        (void) hipGetLastError();
+        (void) hipMemUnmap(va, bytes);
+        (void) hipMemRelease(h);
+        return false;
+    }
+    handle = (unsigned long long) (uintptr_t) h;
+    return true;
+}
+bool band_unmap(uint8_t* va, size_t bytes, unsigned long long handle) {
+    const bool a = hipMemUnmap(va, bytes) == hipSuccess;
+    const bool b = hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) handle) == hipSuccess;
+    if (!a || !b) (void) hipGetLastError();
+    return a && b;
+}
+}  // namespace
+#endif
+
+bool ExpertCache::band_supported() {
+#if defined(STRATA_EC_HIP_BAND)
+    int dev = 0, s = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return false;
+    if (hipDeviceGetAttribute(&s, hipDeviceAttributeVirtualMemoryManagementSupported, dev) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    return s != 0 && band_granularity() > 0;
+#else
+    return false;
+#endif
+}
+
+bool ExpertCache::open_band(uint64_t want, std::string& err) {
+#if defined(STRATA_EC_HIP_BAND)
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    const uint64_t g = band_gran_ > 0 ? band_gran_ : 1;
+    band_total_ = (want + g - 1) / g * g;
+    void* va = nullptr;
+    if (hipMemAddressReserve(&va, (size_t) band_total_, 0, nullptr, 0) != hipSuccess || va == nullptr) {
+        (void) hipGetLastError();
+        err = "ExpertCache: band: cannot reserve the address range";
+        band_total_ = 0;
+        return false;
+    }
+    base_ = (uint8_t*) va;
+    const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
+    const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
+    for (int i = 0; i < 3; ++i) {
+        if (to[i] <= from[i]) continue;
+        if (!band_map(dev, base_ + from[i], (size_t) (to[i] - from[i]), band_h_[i])) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: part %d of the band layout (%.2f GiB) "
+                          "could not be allocated", i + 1, (double) (to[i] - from[i]) / 1073741824.0);
+            err = buf;
+            release_band();
+            return false;
+        }
+    }
+    band_mapped_ = true;
+    return true;
+#else
+    (void) want;
+    err = "ExpertCache: the band needs HIP's virtual memory management";
+    return false;
+#endif
+}
+
+void ExpertCache::release_band() {
+#if defined(STRATA_EC_HIP_BAND)
+    if (base_ != nullptr) (void) hipDeviceSynchronize();
+    const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
+    const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
+    for (int i = 0; i < 3; ++i)
+        if (band_h_[i] != 0 && base_ != nullptr) band_unmap(base_ + from[i], (size_t) (to[i] - from[i]), band_h_[i]);
+    if (base_ != nullptr && band_total_ > 0) (void) hipMemAddressFree(base_, (size_t) band_total_);
+#endif
+    band_h_[0] = band_h_[1] = band_h_[2] = 0;
+    band_mapped_ = false;
+    band_total_ = 0;
+    base_ = nullptr;
+}
+
+bool ExpertCache::band_release(std::string& err) {
+#if defined(STRATA_EC_HIP_BAND)
+    if (band_n_ <= 0) { err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)"; return false; }
+    if (!band_mapped_) return true;
+    if (hipDeviceSynchronize() != hipSuccess) {
+        err = std::string("the device failed before the band was released: ") + hipGetErrorString(hipGetLastError());
+        return false;
+    }
+    if (!band_unmap(base_ + band_lo_, (size_t) band_size_, band_h_[1])) {
+        err = "the driver refused to release the expert cache's band";
+        return false;
+    }
+    band_h_[1] = 0;
+    band_mapped_ = false;
+    return true;
+#else
+    err = "the band needs HIP";
+    return false;
+#endif
+}
+
+bool ExpertCache::band_restore(std::string& err) {
+#if defined(STRATA_EC_HIP_BAND)
+    if (band_n_ <= 0) { err = "the expert cache has no band (STRATA_VRAM_BAND_MIB)"; return false; }
+    if (band_mapped_) return true;
+    int dev = 0;
+    (void) hipGetDevice(&dev);
+    if (!band_map(dev, base_ + band_lo_, (size_t) band_size_, band_h_[1])) {
+        err = "the driver has no VRAM for the expert cache's band now";
+        return false;
+    }
+    band_mapped_ = true;
+    if (hipMemset(base_ + band_lo_, 0, (size_t) band_size_) != hipSuccess) {
+        (void) hipGetLastError();   // not fatal: every band slot is refilled before it is used
+    }
+    return true;
+#else
+    err = "the band needs HIP";
+    return false;
+#endif
+}
+
+bool ExpertCache::zero_all() {
+    if (base_ == nullptr) return false;
+    if (band_n_ > 0 || band_layout_) {
+        const uint64_t lo = band_lo_, hi = band_lo_ + band_size_;
+        const uint64_t from[3] = {0, lo, hi}, to[3] = {lo, hi, band_total_};
+        bool ok = true;
+        for (int i = 0; i < 3; ++i)
+            if (to[i] > from[i] && band_h_[i] != 0)
+                ok = cudaMemset(base_ + from[i], 0, (size_t) (to[i] - from[i])) == cudaSuccess && ok;
+        return ok;
+    }
+    return cudaMemset(base_, 0, (size_t) bytes()) == cudaSuccess;
+}
+
 #if defined(STRATA_USE_HIP)
 bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     if (bytes <= blocking_staging_bytes_) return true;
@@ -502,7 +683,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+    if (band_layout_) {   // r7: the releasable band (open_sized laid it out)
+        if (!open_band(want, err)) return false;
+    } else if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
@@ -526,7 +709,16 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+    bool zeroed = false;
+    if (band_layout_) {   // one memset per physical allocation (ROCm refuses one across them)
+        const uint64_t from[3] = {0, band_lo_, band_lo_ + band_size_}, to[3] = {band_lo_, band_lo_ + band_size_, band_total_};
+        zeroed = true;
+        for (int i = 0; i < 3; ++i)
+            if (to[i] > from[i]) zeroed = cudaMemset(base_ + from[i], 0, (size_t) (to[i] - from[i])) == cudaSuccess && zeroed;
+    } else {
+        zeroed = cudaMemset(base_, 0, (size_t) want) == cudaSuccess;
+    }
+    if (!zeroed) {
         err = "ExpertCache: cudaMemset of the slot arena failed";
         close();
         return false;
@@ -561,19 +753,54 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
-    int64_t mx = 0;
-    std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
-    for (size_t i = 0; i < slot_bytes.size(); ++i) {
-        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
-        off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
-        mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+    const int64_t n_all = (int64_t) slot_bytes.size();
+    // r7: the band (set_band) - only inside the arena, never its last slot, and not with the other VMM layouts
+    int64_t bf = band_req_first_, be = band_req_first_ + band_req_n_;
+    uint64_t g = 0;
+    const bool want_band = band_req_n_ > 0 && seg_req_ == 0 && bf > 0 && be < n_all;
+#if defined(STRATA_EC_HIP_BAND)
+    if (want_band && band_supported()) g = band_granularity();
+#endif
+    if (want_band && g == 0)
+        std::fprintf(stderr, "ExpertCache: the releasable band is off: this GPU or driver has no virtual memory "
+                             "management\n");
+    for (int pass = (g > 0 ? 0 : 1); pass < 2; ++pass) {
+        const bool band = pass == 0;
+        int64_t mx = 0;
+        std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
+        for (size_t i = 0; i < slot_bytes.size(); ++i) {
+            if (band && ((int64_t) i == bf || (int64_t) i == be)) off[i] = (off[i] + g - 1) / g * g;
+            // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
+            off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
+            mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+        }
+        band_layout_ = band;
+        band_gran_ = band ? g : 0;
+        band_lo_ = band ? off[(size_t) bf] : 0;
+        band_size_ = band ? off[(size_t) be] - off[(size_t) bf] : 0;
+        // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
+        const bool ok = open((int64_t) off.back(), n_layers, n_expert, 1, err);
+        band_layout_ = false;
+        if (!ok) {
+            band_lo_ = band_size_ = 0;
+            if (band && err.find("only") == std::string::npos) {   // not a plain "too little VRAM": try one allocation
+                std::fprintf(stderr, "ExpertCache: the releasable band could not be laid out (%s); one allocation "
+                                     "instead\n", err.c_str());
+                continue;
+            }
+            return false;
+        }
+        if (band) {
+            band_first_ = bf;
+            band_n_ = be - bf;
+        }
+        slots_ = n_all;
+        live_slots_ = slots_;
+        blob_ = mx;
+        off_ = std::move(off);
+        break;
     }
-    // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
-    slots_ = (int64_t) slot_bytes.size();
-    live_slots_ = slots_;
-    blob_ = mx;
-    off_ = std::move(off);
+    if (base_ == nullptr) return false;
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
@@ -598,7 +825,11 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (!segs_.empty()) {
+    if (band_h_[0] != 0 || band_h_[1] != 0 || band_h_[2] != 0 || band_total_ > 0) {
+        release_band();
+        band_n_ = 0;
+        band_first_ = 0;
+    } else if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
         vmm_.reset();   // unmaps and frees every chunk it still holds

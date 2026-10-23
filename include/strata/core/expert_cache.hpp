@@ -131,6 +131,28 @@ public:
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.
     bool grow(int64_t want_bytes, std::string& err);
+    /// **r7 (q5opt, Oct 2026): THE RELEASABLE BAND, HIP (ROCm virtual memory management).  STRATA_VRAM_BAND_MIB.**
+    /// `--vram-elastic` gives back the cache's LAST slots, which on this engine are also the prompt path's loan, and
+    /// ROCm's runtime copies refuse a range that spans two physical allocations (each mapping is its own memory
+    /// object).  The band is a run of slots `[first, first + n)` in the MIDDLE of the arena, backed by its own
+    /// physical allocation (the slots before it and after it by one allocation each, all in one reserved address
+    /// range, so every slot keeps its address and the captured graphs stay valid).  `band_release` evicts nothing by
+    /// itself: the CALLER first takes every resident expert out of the band (they become CPU / file-tier misses), then
+    /// the band's VRAM goes back to the driver - for the vision encoder.  `band_restore` maps it again (empty: the
+    /// caller refills).  The loan (the last slots) never reaches the band (checked by the caller).  Set before
+    /// `open_sized`; 0 slots or a GPU without virtual memory management: one allocation as always.
+    void set_band(int64_t first_slot, int64_t n_slots) { band_req_first_ = first_slot; band_req_n_ = n_slots; }
+    static bool band_supported();
+    bool band_on() const { return band_n_ > 0; }
+    bool band_mapped() const { return band_n_ > 0 && band_mapped_; }
+    int64_t band_first() const { return band_first_; }
+    int64_t band_end() const { return band_first_ + band_n_; }
+    int64_t band_slots() const { return band_n_; }
+    int64_t band_bytes() const { return (int64_t) band_size_; }
+    bool band_release(std::string& err);
+    bool band_restore(std::string& err);
+    /// Zeroes the whole arena (one memset per physical allocation in band mode; ROCm refuses one across them).
+    bool zero_all();
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
     /// The bytes the first `n` slots span.
@@ -227,6 +249,17 @@ private:
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
+    // r7 band (set_band): the arena = [0, band_lo_) + [band_lo_, band_lo_ + band_size_) + the rest, three physical
+    // allocations in one reserved range of band_total_ bytes
+    bool open_band(uint64_t want, std::string& err);
+    void release_band();
+    int64_t band_req_first_ = 0, band_req_n_ = 0;
+    int64_t band_first_ = 0, band_n_ = 0;
+    uint64_t band_lo_ = 0, band_size_ = 0, band_total_ = 0;   ///< byte offsets/sizes (granularity-aligned)
+    uint64_t band_gran_ = 0;
+    unsigned long long band_h_[3] = {0, 0, 0};   ///< physical handles: before, band, after (0: none/unmapped)
+    bool band_mapped_ = false;
+    bool band_layout_ = false;   ///< open() allocates through open_band (set by open_sized)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;
