@@ -628,6 +628,7 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert) {
 // A read-ahead worker: takes a predicted (layer, expert), skips it when its pages are cached or it is already
 // staged, and otherwise reads the whole blob into a staging buffer (copy_from_files preads what is not cached).
 void FileExpertSource::io_worker() {
+    strata::kernels::cpu::helper_thread_affinity();   // q5opt r6-mem: STRATA_HELPER_CPUS
     for (;;) {
         int32_t layer, expert;
         {
@@ -1405,7 +1406,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     };
     const size_t nt = std::min<size_t>(todo.size(), (size_t) fetch_threads_);
     std::vector<std::thread> th;
-    for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
+    for (size_t t = 1; t < nt; ++t) th.emplace_back([&] { strata::kernels::cpu::helper_thread_affinity(); work(); });
     work();
     for (auto& t : th) t.join();
 }
@@ -2027,6 +2028,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
 }
 
 void RouterLookahead::run() {
+    strata::kernels::cpu::helper_thread_affinity();   // q5opt r6-mem: STRATA_HELPER_CPUS
     std::vector<float> logits((size_t) (8 * n_expert_));
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;

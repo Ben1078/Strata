@@ -131,6 +131,21 @@ struct ThreadAffinity {
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
 
+/// q5opt r6-mem, STRATA_HELPER_CPUS (Linux; default unset = nothing changes): the host thread pins itself to one
+/// logical CPU for the session (SessionLoopScratch::init), and every thread created after that INHERITS that one-CPU
+/// affinity - the prompt path's 32 stager threads and its issuer, the asynchronous adaptive tier's job thread - so
+/// they time-slice with the spinning host (16 M involuntary switches of the host thread measured in production).
+/// With STRATA_HELPER_CPUS=auto (or a cpulist such as "8-15") such helper threads call `helper_thread_affinity` first
+/// and run on those CPUs instead: `auto` = every online CPU except the expert pool's (its workers and the host).
+/// Only where threads run changes, never what they compute.
+/// `note_pool_cpus`: the pool's logical CPUs (the constructor records them, before the host pins itself).
+void note_pool_cpus(const std::vector<int>& cpus);
+/// The helper CPUs (empty: the feature is off).
+const std::vector<int>& helper_cpus();
+/// The calling thread onto the helper CPUs (`index` < 0: all of them; else only helper_cpus()[index % n]).
+/// False (and nothing changed) when off or when the call failed.
+bool helper_thread_affinity(int index = -1);
+
 class ExpertPool {
 public:
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores

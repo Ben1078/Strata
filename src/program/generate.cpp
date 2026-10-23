@@ -1277,6 +1277,7 @@ private:
         const char* c = std::getenv("STRATA_ADAPT_JOB_CPU");
         const int cpu = c != nullptr ? std::atoi(c) : smt_spare_cpu();
         if (cpu >= 0) (void) strata::kernels::cpu::pin_current_thread(cpu);
+        else (void) strata::kernels::cpu::helper_thread_affinity();   // q5opt r6-mem: STRATA_HELPER_CPUS
         for (;;) {
             std::function<void()> f;
             {

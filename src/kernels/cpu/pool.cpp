@@ -11,7 +11,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <string>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -402,6 +405,127 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 }
 
 namespace {
+std::mutex g_pool_cpus_mu;
+std::vector<int> g_pool_cpus;   // the expert pool's logical CPUs (workers + host), recorded by its constructor
+}  // namespace
+
+void note_pool_cpus(const std::vector<int>& cpus) {
+    std::lock_guard<std::mutex> lk(g_pool_cpus_mu);
+    for (int c : cpus)
+        if (c >= 0 && std::find(g_pool_cpus.begin(), g_pool_cpus.end(), c) == g_pool_cpus.end()) g_pool_cpus.push_back(c);
+}
+
+namespace {
+// q5opt r6-mem: the helper CPU lists, computed once they can be (see helper_cpus)
+std::mutex g_helper_mu;
+bool g_helper_ready = false;
+std::vector<int> g_helper_all, g_helper_general, g_helper_pf;
+const std::vector<int> g_helper_none;
+
+void parse_cpulist(const char* text, std::vector<int>& out) {
+    for (const char* p = text; *p;) {
+        char* end = nullptr;
+        const long lo = std::strtol(p, &end, 10);
+        if (end == p) break;
+        long hi = lo;
+        if (*end == '-') {
+            p = end + 1;
+            hi = std::strtol(p, &end, 10);
+        }
+        for (long c = lo; c <= hi && c < 4096; ++c) out.push_back((int) c);
+        p = end;
+        while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+    }
+}
+
+// false: not computable yet (`auto` before the pool exists)
+bool helper_init_locked() {
+    if (g_helper_ready) return true;
+#if defined(__linux__)
+    const char* e = std::getenv("STRATA_HELPER_CPUS");
+    if (e == nullptr || *e == '\0' || std::strcmp(e, "0") == 0) { g_helper_ready = true; return true; }
+    std::vector<int> v;
+    if (std::strcmp(e, "auto") == 0 || std::strcmp(e, "1") == 0) {
+        std::vector<int> online;
+        if (std::FILE* f = std::fopen("/sys/devices/system/cpu/online", "r")) {
+            char text[1024] = {0};
+            const size_t n = std::fread(text, 1, sizeof text - 1, f);
+            std::fclose(f);
+            text[n] = '\0';
+            parse_cpulist(text, online);
+        }
+        std::lock_guard<std::mutex> lk2(g_pool_cpus_mu);
+        if (g_pool_cpus.empty()) return false;   // no (pinned) pool yet: ask again later
+        for (int c : online)
+            if (std::find(g_pool_cpus.begin(), g_pool_cpus.end(), c) == g_pool_cpus.end()) v.push_back(c);
+    } else {
+        parse_cpulist(e, v);
+    }
+    // the L3 prefetch threads' own CPUs (STRATA_L3_PF_CPUS, else the last STRATA_L3_PF_THREADS of the list), kept out of
+    // the other helpers' mask when CPUs remain for them: a stager or the adaptive tier's memcpy preempting a prefetch
+    // thread costs it the whole ~0.3 ms gap
+    std::vector<int> pf;
+    if (const char* pc = std::getenv("STRATA_L3_PF_CPUS"); pc != nullptr && *pc) parse_cpulist(pc, pf);
+    else if (!v.empty()) {
+        const char* pt = std::getenv("STRATA_L3_PF_THREADS");
+        const int k = (std::max)(1, (std::min)((int) v.size(), pt != nullptr ? std::atoi(pt) : 1));
+        for (int i = 0; i < k; ++i) pf.push_back(v[v.size() - 1 - (size_t) i]);
+    }
+    std::vector<int> gen;
+    for (int c : v)
+        if (std::find(pf.begin(), pf.end(), c) == pf.end()) gen.push_back(c);
+    if (gen.empty()) gen = v;
+    auto str = [](const std::vector<int>& l) {
+        std::string s;
+        for (int c : l) s += (s.empty() ? "" : ",") + std::to_string(c);
+        return s.empty() ? std::string("(none)") : s;
+    };
+    std::fprintf(stderr, "strata cpu pool: STRATA_HELPER_CPUS=%s: helper threads (stager, issuer, adaptive tier, lookahead, "
+                         "I/O) on CPUs %s; L3 prefetch threads on %s\n", e, str(gen).c_str(), str(pf).c_str());
+    g_helper_all = std::move(v);
+    g_helper_general = std::move(gen);
+    g_helper_pf = std::move(pf);
+#endif
+    g_helper_ready = true;
+    return true;
+}
+}  // namespace
+
+const std::vector<int>& helper_cpus() {
+    std::lock_guard<std::mutex> lk(g_helper_mu);
+    return helper_init_locked() ? g_helper_all : g_helper_none;
+}
+
+bool helper_thread_affinity(int index) {
+#if defined(__linux__)
+    std::vector<int> v;
+    {
+        std::lock_guard<std::mutex> lk(g_helper_mu);
+        if (!helper_init_locked() || g_helper_all.empty()) return false;
+        if (index >= 0) {
+            const std::vector<int>& l = g_helper_pf.empty() ? g_helper_all : g_helper_pf;
+            v.push_back(l[(size_t) index % l.size()]);
+        } else {
+            v = g_helper_general;
+        }
+    }
+    int maxc = 0;
+    for (int c : v) maxc = (std::max)(maxc, c);
+    detail::LinuxCpuSet target(maxc < CPU_SETSIZE ? CPU_SETSIZE : maxc + 1);
+    if (!target.set) return false;
+    for (int c : v) CPU_SET_S(c, target.bytes, target.set);
+    const int rc = pthread_setaffinity_np(pthread_self(), target.bytes, target.set);
+    if (rc != 0)
+        std::fprintf(stderr, "strata cpu pool: STRATA_HELPER_CPUS: setting a helper thread's affinity (%d CPUs from %d) "
+                             "failed: %s\n", (int) v.size(), v.empty() ? -1 : v[0], std::strerror(rc));
+    return rc == 0;
+#else
+    (void) index;
+    return false;
+#endif
+}
+
+namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
@@ -446,6 +570,17 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         n_ = (int) topo_.worker_cores.size();
     }
     if (n_ < 1) n_ = 1;
+    {   // q5opt r6-mem: STRATA_HELPER_CPUS=auto keeps helper threads off these
+        std::vector<int> mine;
+        if (pin) {
+            if (topo_.host_core >= 0) mine.push_back(topo_.host_core);
+            for (int i = 0; i < n_ && i < (int) topo_.worker_cores.size(); ++i) mine.push_back(topo_.worker_cores[(size_t) i]);
+        }
+        note_pool_cpus(mine);
+        if (!pin)
+            if (const char* e = std::getenv("STRATA_HELPER_CPUS"); e != nullptr && (std::strcmp(e, "auto") == 0 || std::strcmp(e, "1") == 0))
+                std::fprintf(stderr, "strata cpu pool: STRATA_HELPER_CPUS=auto has no effect: the pool is not pinned\n");
+    }
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
