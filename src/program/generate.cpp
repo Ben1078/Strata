@@ -63,6 +63,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/cost_policy.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -562,6 +563,13 @@ struct Options {
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    /// q5opt r6-spec: --spec-policy cost (opt-in; default "step" = --spec-min-p's per-draft floor) sizes each MTP
+    /// window by spec/cost_policy.hpp's rule: the calibrated probability that all its drafts are accepted against the
+    /// measured cost of a window row at the current decode rate.  Serial decode loop only.
+    bool spec_policy_cost = false;
+    /// q5opt r6-spec: --sfx-any M (opt-in, 0 = off): a lookup (suffix) window may be taken even when the MTP's first
+    /// draft disagrees with it, if its match is at least M tokens (the draft policy still weighs it against the MTP's)
+    int sfx_any = 0;
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
@@ -1743,6 +1751,8 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
         else if (a == "--adapt-async") o.adapt_async = std::atoi(next("--adapt-async")) != 0 ? 1 : 0;
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--spec-policy") o.spec_policy_cost = std::string(next("--spec-policy")) == "cost";
+        else if (a == "--sfx-any") o.sfx_any = std::max(0, std::atoi(next("--sfx-any")));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -7968,6 +7978,7 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        strata::spec::CostPolicy cpol;         // q5opt r6-spec: MTP window sizes (--spec-policy cost), learned likewise
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -8800,6 +8811,35 @@ int main(int argc, char** argv) {
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
+                }
+            }
+            // q5opt r6-spec STRATA_SPEC_TUNE_FILE (a measurement aid, read at each request): key=value words - spec_t
+            // (this request's MTP window cap, at most the loaded one), sfx (0 = no suffix drafts, 2 = proposals logged
+            // but never taken), chain, min_p, gate (a cumulative raw draft-probability floor), policy (1 = the cost
+            // policy, 0 = the per-draft floor) and the cost policy's overrides theta, dv, margin, raw
+            int req_spec_t = 0, req_sfx = -1, req_chain = -1, req_policy = o.spec_policy_cost ? 1 : 0, req_raw = 0;
+            int req_sfx_any = o.sfx_any;   // a lookup window without the MTP's agreement from this match length on
+            double req_gate = 0.0, req_theta = -1.0, req_dv = -1.0, req_margin = 0.0;
+            static const char* const spec_tune_file = std::getenv("STRATA_SPEC_TUNE_FILE");
+            if (spec_tune_file != nullptr) {
+                std::ifstream tin(spec_tune_file);
+                std::string kv;
+                while (tin >> kv) {
+                    const size_t eq = kv.find('=');
+                    if (eq == std::string::npos) continue;
+                    const std::string k = kv.substr(0, eq);
+                    const double v = std::atof(kv.c_str() + eq + 1);
+                    if (k == "spec_t") req_spec_t = (int) v;
+                    else if (k == "sfx") req_sfx = (int) v;
+                    else if (k == "chain") req_chain = (int) v;
+                    else if (k == "min_p") req_spec_min_p = std::clamp(v, 0.0, 1.0);
+                    else if (k == "gate") req_gate = std::clamp(v, 0.0, 1.0);
+                    else if (k == "policy") req_policy = (int) v;
+                    else if (k == "theta") req_theta = v;
+                    else if (k == "dv") req_dv = v;
+                    else if (k == "margin") req_margin = v;
+                    else if (k == "raw") req_raw = (int) v;
+                    else if (k == "sfx_any") req_sfx_any = (int) v;
                 }
             }
             std::string emb_path;
@@ -9792,6 +9832,48 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+            // q5opt r6-spec: this request's MTP window cap, suffix window cap and switches (STRATA_SPEC_TUNE_FILE), and
+            // the MTP window rule: the cost policy, a cumulative raw floor (gate=G), or --spec-min-p's per-draft floor
+            const int S_mtp_q = req_spec_t > 0 ? std::clamp(req_spec_t, 1, S_mtp) : S_mtp;
+            const int S_q = req_spec_t > 0 ? std::clamp(req_spec_t + 2, S_mtp_q, S) : S;
+            const int sfx_mode_q = o.suffix_draft <= 0 ? 0 : req_sfx >= 0 ? req_sfx : 1;   // 2: logged, never taken
+            const int chain_q = req_chain >= 0 ? std::min(req_chain, o.lookup_chain) : o.lookup_chain;
+            const bool cost_q = req_policy > 0 && use_mtp && !pipe;
+            const bool gate_q = !cost_q && req_gate > 0.0 && use_mtp && !pipe;
+            const bool sampled_q = !req_sp.greedy;
+            cpol.set_fixed_theta(req_theta);
+            cpol.set_fixed_dv(req_dv);
+            cpol.set_margin(req_margin);
+            cpol.set_raw(req_raw > 0);
+            if (spec_tune_file != nullptr && use_mtp && !pipe)
+                mtp.set_max_drafts(S_mtp_q < S || mtp.max_t() > S_mtp_q ? S_mtp_q - 1 : (1 << 30));
+            double keep_pc = 1.0;   // the chain's cumulative (calibrated or raw) probability so far
+            if (use_mtp && !pipe) {
+                if (cost_q)
+                    mtp.set_keep_drafting([&](int j, float pj) {
+                        if (j == 0) keep_pc = 1.0;
+                        keep_pc *= cpol.cal(pj, j, sampled_q);
+                        return cpol.keep_drafting(keep_pc, j + 1, sampled_q);
+                    });
+                else if (gate_q)
+                    mtp.set_keep_drafting([&](int j, float pj) {
+                        if (j == 0) keep_pc = 1.0;
+                        keep_pc *= pj;
+                        return keep_pc >= req_gate;
+                    });
+                else
+                    mtp.set_keep_drafting(nullptr);
+            }
+            const float draft_min_p = (cost_q || gate_q) ? 1e-6f : (float) req_spec_min_p;
+            int n_drafted_prev = 0, n_drafted_now = 0;
+            std::array<float, 8> wprob{};
+            std::array<int32_t, 8> wdraft{}, wsfx{};
+            int wsfx_k = 0, wsfx_m = 0;
+            // STRATA_SPEC_CALIB=1: per request the verify ms by window size and the cost policy's state; =2: also one
+            // SPECW line per window (position, size, accepted, source, ms, drafts, probabilities, lookup, committed)
+            static const int spec_calib = [] { const char* e = std::getenv("STRATA_SPEC_CALIB"); return e ? std::atoi(e) : 0; }();
+            double cal_win_ms[9] = {};
+            int64_t cal_win_n[9] = {};
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
@@ -10442,31 +10524,46 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
+                int T = use_mtp ? S_mtp_q : 1;   // no --mtp: one token a round unless a lookup draft fires
+                if (use_mtp && cost_q) {   // q5opt r6-spec: the cost policy
+                    T = cpol.window(dprob.data(), n_drafted_prev, S_mtp_q, sampled_q);
+                } else if (use_mtp && gate_q) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    double cum = 1.0;
+                    while (T < S_mtp_q && T - 1 < n_drafted_prev && (cum *= dprob[(size_t) T - 1]) >= req_gate) ++T;
+                } else if (use_mtp && req_spec_min_p > 0.0) {
+                    T = 1;
+                    while (T < S_mtp_q && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                // q5opt r6-spec (cost policy only): no rows past what the reply may still emit (max_tokens) - a window of
+                // T rows commits at most T tokens, so the rows beyond the remainder could only be thrown away
+                if (cost_q) T = (int) std::max<int64_t>(1, std::min<int64_t>(T, max_new - produced_n));
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
-                    const int k = sfx.propose(S - 1, sbuf.data());
+                wsfx_k = 0;
+                wsfx_m = 0;
+                if (sfx_mode_q > 0 && !first_window) {
+                    const int k = sfx.propose(S_q - 1, sbuf.data());
                     sfx_match = sfx.last_match();
-                    if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                    wsfx_k = std::min(k, 8);
+                    wsfx_m = sfx_match;
+                    for (int i = 0; i < wsfx_k; ++i) wsfx[(size_t) i] = sbuf[(size_t) i];
+                    if (sfx_mode_q == 1 && k > 0 &&
+                        (!use_mtp || sbuf[0] == drafts[0] || (req_sfx_any > 0 && sfx_match >= req_sfx_any))) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
-                if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                if (chain_q > 0 && !first_window && !from_sfx && T < S_q) {
                     int csrc = -1;
                     const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
                     chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
-                                                                 std::min(o.lookup_chain, S - T), o.lookup_chain_min,
+                                                                 std::min(chain_q, S_q - T), o.lookup_chain_min,
                                                                  cbuf.data(), &cm, &csrc);
                     // the policy keeps the chained tokens that pay at this machine's measured window costs
                     if (chain_n > 0 && !chain_fixed) {
@@ -10478,6 +10575,11 @@ int main(int argc, char** argv) {
                 const int T_mtp = T;
                 T += chain_n;
                 const bool timed_round = !first_window;
+                for (int i = 0; i < 8; ++i) {   // q5opt r6-spec: this window's MTP drafts (draft() overwrites them)
+                    wprob[(size_t) i] = i < n_drafted_prev ? dprob[(size_t) i] : 0.0f;
+                    wdraft[(size_t) i] = i < n_drafted_prev ? drafts[(size_t) i] : -1;
+                }
+                const int w_ndrafted = n_drafted_prev;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
                 window[0] = x;
@@ -10563,14 +10665,19 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                n_drafted_now = 0;
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_min_p,
+                                               &n_drafted_now);
+                double draft_ms_now = 0.0;
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                    draft_ms_now = msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
                 }
+                n_drafted_prev = n_drafted_now;
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -10579,6 +10686,36 @@ int main(int argc, char** argv) {
                 if (!drafted) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                if (timed_round && !eos) {   // q5opt r6-spec: the cost policy learns from every round (cheap)
+                    const double vms = std::chrono::duration<double, std::milli>(tw1 - tw0).count();
+                    const double rms = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                    if (use_mtp && !from_sfx && chain_n == 0) cpol.observe(T, a, wprob.data(), sampled_q, vms, rms, a + 1);
+                    else cpol.observe_rate(rms, a + 1);
+                    if (n_drafted_now > 0) cpol.observe_draft(n_drafted_now, draft_ms_now);
+                    if (spec_calib > 0) { cal_win_ms[std::min(T, 8)] += vms; ++cal_win_n[std::min(T, 8)]; }
+                    if (spec_calib >= 2) {
+                        std::string wl;
+                        char b[128];
+                        std::snprintf(b, sizeof b, "SPECW %lld %d %d %d %.2f %.2f %.2f %d %d %d %d", (long long) p, T, a,
+                                      from_sfx ? 1 : chain_n > 0 ? 2 : 0, vms, rms, draft_ms_now, T_mtp, w_ndrafted,
+                                      wsfx_k, wsfx_m);
+                        wl = b;
+                        auto ids = [&](const char* tag, const int32_t* v, int n) {
+                            wl += tag;
+                            for (int i = 0; i < n; ++i) { std::snprintf(b, sizeof b, i ? ",%d" : "%d", (int) v[i]); wl += b; }
+                        };
+                        ids(" d=", wdraft.data(), std::min(w_ndrafted, 8));
+                        wl += " p=";
+                        for (int i = 0; i < std::min(w_ndrafted, 8); ++i) {
+                            std::snprintf(b, sizeof b, i ? ",%.4f" : "%.4f", (double) wprob[(size_t) i]);
+                            wl += b;
+                        }
+                        ids(" s=", wsfx.data(), wsfx_k);
+                        ids(" w=", window.data(), T);
+                        ids(" c=", outv.data(), a + 1);
+                        std::fprintf(stderr, "%s\n", wl.c_str());
+                    }
                 }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -10592,6 +10729,7 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (use_mtp && !pipe) mtp.set_keep_drafting(nullptr);   // q5opt r6-spec: its captures end with the request
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10915,6 +11053,18 @@ int main(int argc, char** argv) {
             if (sfx_windows > 0)
                 std::fprintf(stderr, "strata serve: suffix drafts: %lld windows, %lld of %lld drafts accepted\n",
                              (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);
+            if (cost_q || spec_calib > 0) {   // q5opt r6-spec
+                std::string s1;
+                char b[64];
+                for (int t = 1; t <= 8; ++t)
+                    if (cal_win_n[t] > 0) {
+                        std::snprintf(b, sizeof b, " T%d:%lld/%.2f", t, (long long) cal_win_n[t], cal_win_ms[t] / (double) cal_win_n[t]);
+                        s1 += b;
+                    }
+                std::fprintf(stderr, "strata spec policy: %s rule=%s spec_t=%d sfx=%d windows=%lld tokens=%lld | verify ms by T:%s | %s\n",
+                             cost_q ? "cost" : "step", cost_q ? "cost" : gate_q ? "gate" : "min_p", S_mtp_q, sfx_mode_q,
+                             (long long) dec_windows, (long long) produced_n, s1.c_str(), cpol.summary().c_str());
+            }
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);

@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,10 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// q5opt r6-spec (--spec-policy cost, STRATA_SPEC_TUNE_FILE gate=): while set, draft() keeps drafting while
+    /// keep(j, p_j) holds (j: the index of the draft just made, p_j its draft probability) instead of while
+    /// p_j >= min_p (min_p must still be > 0: the step-by-step path).  An empty function restores the min_p rule.
+    void set_keep_drafting(std::function<bool(int, float)> f) { keep_ = std::move(f); }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
     void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
@@ -192,6 +197,7 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    std::function<bool(int, float)> keep_;   // q5opt r6-spec: set_keep_drafting
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
