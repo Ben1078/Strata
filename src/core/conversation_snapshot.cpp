@@ -3,6 +3,7 @@
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -251,6 +252,74 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     s.error = [why] { return *why; };
     out = std::move(s);
     return true;
+}
+
+// ---- r8 (q5opt) park files
+bool conversation_kv_keep_bytes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                                int64_t keep_tokens, std::array<uint64_t, 5>& keep, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    keep_tokens = std::clamp<int64_t>(keep_tokens, 0, upto);
+    const int64_t whole = (keep_tokens / l.page_size) * l.page_size;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    for (size_t i = 0; i < 4; ++i) keep[i] = l.cells ? (uint64_t) (sizes[i] / size_t(l.cells)) * (uint64_t) whole : 0;
+    keep[4] = index ? (uint64_t) (keep_tokens / strata::kernels::qsa_real_shapes().idx_block) *
+                      (uint64_t) g.idx_key_dim * sizeof(float) : 0;
+    for (size_t i = 0; i < 5; ++i) keep[i] = std::min<uint64_t>(keep[i], sizes[i]);
+    return true;
+}
+
+bool conversation_kv_sink(SessionKvSink& out, const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                          std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvSink s;
+    s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < 5; ++i)
+        if (s.sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.write = [dst, sizes, why](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V write out of range"; return false; }
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    s.error = [why] { return *why; };
+    out = std::move(s);
+    return true;
+}
+
+bool conversation_kv_header_check(const SessionKvSource& h, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                                  bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    if (h.format != l.format || h.cells != l.cells || h.heads != g.n_head_kv || h.head_dim != g.head_dim ||
+        h.page_size != l.page_size || h.pooled_rows != l.pooled_rows || h.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    for (size_t i = 0; i < 5; ++i)
+        if (h.sizes[i] != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    const auto dst = pools(st);
+    for (size_t i = 0; i < 5; ++i)
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return true;
+}
+
+bool conversation_kv_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+    return false;
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,

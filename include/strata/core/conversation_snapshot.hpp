@@ -4,6 +4,9 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/session_park.hpp"
+
+#include <functional>
 
 #include <string>
 
@@ -112,5 +115,42 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+
+// ---- r8 (q5opt) park files (session_park.hpp): the incremental save and the streamed restore
+// The bytes of each part that stay the same when the first `keep_tokens` tokens are unchanged: whole pages of the
+// K/V and scales, the indexer's completed rows (its moving spare row is rewritten).
+bool conversation_kv_keep_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                int64_t keep_tokens, std::array<uint64_t, 5>& keep, std::string& error);
+// The layer's authoritative pools as a sink for a streamed restore of `upto` tokens (no copy made here).
+bool conversation_kv_sink(SessionKvSink& sink, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
+// A file's layer header (format, cells, geometry, part sizes) against this layer at `upto` tokens: no state read.
+bool conversation_kv_header_check(const SessionKvSource& header, const QsaState& state, const ModelGeometry& g,
+                                  int64_t upto, bool include_index, std::string& error);
+// After a streamed restore of a layer's pools: the VRAM residency they feed (the stream map reset, the draft ring).
+bool conversation_kv_residency(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+
+bool conversation_park_meta(ParkMeta& meta, const SessionState& session, const ModelGeometry& g, bool cvec);
+// One source per owned QSA layer, then the draft, for `upto` tokens (the device is synchronized first).
+bool conversation_park_sources(std::vector<SessionKvSource>& sources, const SessionState& session,
+                               const ModelGeometry& g, const QsaState& draft, int64_t upto, std::string& error);
+// The unchanged bytes per layer and part for `keep_tokens` unchanged tokens (the draft keeps one token less: its
+// last cell may not have been computed when the output cap was reached).
+bool conversation_park_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& session,
+                            const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t keep_tokens,
+                            std::string& error);
+// Everything a park file restore can check before any device write: geometry, layer range, the conversation
+// metadata, the running state sizes, every layer header.
+bool conversation_park_validate(const ParkMeta& meta, const ConversationCheckpoint& state,
+                                const std::vector<SessionKvSource>& headers, const SessionState& session,
+                                const ModelGeometry& g, const QsaState& draft, std::string& error);
+enum class ParkRestore { restored, invalid, partial, transfer_failed };
+// `stream(sinks)` moves the K/V into the pools: 0 done, 1 the FILE failed (read or hash: the pools hold part of
+// it - `partial`: the device is fine but the session no longer holds any conversation), 2 a device copy failed
+// (`transfer_failed`: the caller must not continue).  Then the residency and the running state.
+ParkRestore conversation_park_restore(const ConversationCheckpoint& state, SessionState& session,
+                                      const ModelGeometry& g, const QsaState& draft,
+                                      const std::function<int(const std::vector<SessionKvSink>&)>& stream,
+                                      std::string& error);
 
 } // namespace strata::core

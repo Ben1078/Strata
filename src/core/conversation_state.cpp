@@ -356,6 +356,79 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     return ConversationRestore::restored;
 }
 
+// ---- r8 (q5opt) park files
+bool conversation_park_meta(ParkMeta& m, const SessionState& ss, const ModelGeometry& g, bool cvec) {
+    m.geometry = geometry_key(g);
+    m.layer_lo = ss.layer_lo;
+    m.layer_hi = ss.layer_hi;
+    m.cvec = cvec;
+    return true;
+}
+
+bool conversation_park_sources(std::vector<SessionKvSource>& sources, const SessionState& ss, const ModelGeometry& g,
+                               const QsaState& draft, int64_t upto, std::string& error) {
+    if (!sync(error)) return false;
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    sources = std::move(out);
+    return true;
+}
+
+bool conversation_park_keep(std::vector<std::array<uint64_t, 5>>& keep, const SessionState& ss,
+                            const ModelGeometry& g, const QsaState& draft, int64_t upto, int64_t keep_tokens,
+                            std::string& error) {
+    const size_t layers = owned_qsa(ss);
+    std::vector<std::array<uint64_t, 5>> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_keep_bytes(owned(ss, j), g, upto, true, keep_tokens, out[j], error)) return false;
+    if (!conversation_kv_keep_bytes(draft, g, upto, false, std::max<int64_t>(0, keep_tokens - 1), out.back(), error))
+        return false;
+    keep = std::move(out);
+    return true;
+}
+
+bool conversation_park_validate(const ParkMeta& meta, const ConversationCheckpoint& state,
+                                const std::vector<SessionKvSource>& headers, const SessionState& ss,
+                                const ModelGeometry& g, const QsaState& draft, std::string& error) {
+    if (meta.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (meta.layer_lo != ss.layer_lo || meta.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    if (!state.stage_parts.empty()) return fail(error, "a park file holds one session");
+    const std::vector<ConversationCheckpoint> none;
+    const ConversationView view{state.ids, state.imgs, none, meta.cvec};
+    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(state, ss, g, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    if (headers.size() != layers + 1) return fail(error, "invalid K/V layer count");
+    const int64_t upto = (int64_t) state.ids.size();
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_header_check(headers[j], owned(ss, j), g, upto, true, error)) return false;
+    return conversation_kv_header_check(headers.back(), draft, g, upto, false, error);
+}
+
+ParkRestore conversation_park_restore(const ConversationCheckpoint& state, SessionState& ss, const ModelGeometry& g,
+                                      const QsaState& draft,
+                                      const std::function<int(const std::vector<SessionKvSink>&)>& stream,
+                                      std::string& error) {
+    const int64_t upto = (int64_t) state.ids.size();
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSink> sinks(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_sink(sinks[j], owned(ss, j), g, upto, true, error)) return ParkRestore::invalid;
+    if (!conversation_kv_sink(sinks.back(), draft, g, upto, false, error)) return ParkRestore::invalid;
+    if (!sync(error)) return ParkRestore::transfer_failed;
+    const int r = stream(sinks);
+    if (r == 1) return ParkRestore::partial;
+    if (r != 0) return ParkRestore::transfer_failed;
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_residency(owned(ss, j), g, upto, error)) return ParkRestore::transfer_failed;
+    if (!conversation_kv_residency(draft, g, upto, error) || !conversation_checkpoint_restore(state, ss, g, error))
+        return ParkRestore::transfer_failed;
+    return ParkRestore::restored;
+}
+
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                  const QsaState& draft, size_t& bytes, std::string& error) {

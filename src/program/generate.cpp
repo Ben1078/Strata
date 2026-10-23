@@ -6938,6 +6938,21 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // r8 (q5opt) park files: the file this engine last wrote or read and how many leading tokens of the session's
+        // K/V are still exactly that file's bytes - every request lowers it to the first cell it writes, a parked
+        // conversation brought back from RAM sets what it held when it was parked (ram_*), anything else zero
+        struct ParkTrack {
+            bool on = false;
+            std::string path;
+            strata::core::ParkFileId file;
+            int64_t unchanged = 0;
+            uint64_t ram_hash = 0;
+            size_t ram_len = 0;
+            int64_t ram_unchanged = 0;
+        } park;
+        auto park_ids_hash = [](const std::vector<int32_t>& ids) {
+            return strata::core::session_hash64(ids.data(), ids.size() * sizeof(int32_t), 0x7061726b);
+        };
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
@@ -7127,7 +7142,13 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                const uint64_t parked_hash = park.on ? park_ids_hash(live) : 0;
                 const bool stored = conversations.put(std::move(image), held);
+                if (stored && park.on) {   // r8: what of it is the park file's, should it come back from RAM
+                    park.ram_hash = parked_hash;
+                    park.ram_len = live.size();
+                    park.ram_unchanged = park.unchanged;
+                }
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -9005,6 +9026,7 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
+                    park.on = false;   // r8: the pools are no longer any park file's
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
@@ -9015,6 +9037,271 @@ int main(int argc, char** argv) {
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
                                  ms(), read_ms);
                     std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                }
+                std::fflush(stdout);
+                continue;
+            }
+            // r8 (q5opt) park files: PARKSAVE <path> | PARKLOAD <path>, between requests.  One conversation kept on
+            // disk between its turns (session_park.hpp): a save that extends the file this engine last wrote or read
+            // appends only what changed (the K/V past the prefix it knows is still the file's, the running state, a
+            // manifest) and publishes it with a new superblock; any other is a whole new file.  The state saved is the
+            // deepest checkpoint on the live conversation (where its next turn resumes), else the live state.  A load
+            // reads the K/V straight into the pools through a 16 MiB buffer (RAM: the running state and the manifest).
+            // Answers: PARKED <tokens> <bytes written> <ms> <file bytes> <append|full>; UNPARKED <tokens> <bytes read>
+            // <ms>; SERR / FATAL / SESSION / SWAIT as SAVE and RESTORE.  A load whose FILE fails after the pools began
+            // to change drops the live session (SERR io ... dropped): the engine stays usable, no conversation is live.
+            if (line.rfind("PARKSAVE ", 0) == 0 || line.rfind("PARKLOAD ", 0) == 0) {
+                const bool save = line[4] == 'S';
+                const std::string path = line.substr(9);
+                const auto t0 = Clock::now();
+                auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
+                                  bool published = false) {
+                    std::fprintf(stderr, "strata serve: park %s %s: %s\n", save ? "save" : "load", path.c_str(), why.c_str());
+                    std::string one = why;
+                    for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                    std::printf("SERR %s %d %s\n", strata::core::session_error_name(kind), published ? 1 : 0, one.c_str());
+                    std::fflush(stdout);
+                    err.clear();
+                };
+                auto moving = [&](uint64_t done, uint64_t total) {
+                    strata::core::progress_at(save ? "writing a park file, MiB" : "reading a park file, MiB",
+                                              (int64_t) (done >> 20));
+                    strata::core::progress_allow(0);
+                    std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
+                    std::fflush(stdout);
+                };
+                auto blocking = [&](const char* phase, uint64_t bytes) {
+                    const int64_t s = strata::core::session_phase_limit_s(bytes);
+                    strata::core::progress_at(phase);
+                    strata::core::progress_allow(s);
+                    std::printf("SWAIT %s %lld\n", phase, (long long) s);
+                    std::fflush(stdout);
+                };
+                strata::core::progress_at(save ? "saving a park file" : "loading a park file");
+                if (path.empty()) { refuse("missing path"); continue; }
+                if (!stages.empty() || multi_gpu) { refuse("park files do not support --layer-split"); continue; }
+                if (o.peer_device >= 1) { refuse("park files do not support --peer-device"); continue; }
+                if (o.batch > 0) { refuse("park files do not support --batch (parallel requests)"); continue; }
+                if (o.prompt_cache <= 0) { refuse("park files need --prompt-cache > 0"); continue; }
+                if (!use_mtp) { refuse("park files need --mtp (the draft layer's K/V is part of the file)"); continue; }
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                strata::core::SessionFileIdentity id;
+                try {
+                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
+                        refuse(err, strata::core::SessionError::io);
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
+                    continue;
+                }
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                auto admit = [floor, &o](uint64_t need, std::string& why) {
+                    const auto avail = strata::core::conversation_available_memory();
+                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                    why = "not enough RAM (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                          std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                          (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
+                    return false;
+                };
+                if (save) {
+                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    try {
+                        // the deepest checkpoint on the live conversation: where its next turn resumes
+                        const ConvCheckpoint* state = nullptr;
+                        for (const ConvCheckpoint& c : checks) {
+                            if (c.ids.empty() || c.ids.size() > live.size() || !c.stage_parts.empty() ||
+                                !std::equal(c.ids.begin(), c.ids.end(), live.begin()) ||
+                                c.imgs != imgs_below(live_imgs, (int64_t) c.ids.size())) continue;
+                            if (!state || c.ids.size() > state->ids.size()) state = &c;
+                        }
+                        ConvCheckpoint live_state;
+                        if (!state) {   // none: the live state itself (copied off the device)
+                            std::string why;
+                            if (!admit(64u << 20, why)) { refuse(why, strata::core::SessionError::memory); continue; }
+                            blocking("capture", 64u << 20);
+                            live_state.ids = live;
+                            live_state.imgs = live_imgs;
+                            if (!strata::core::conversation_checkpoint_save(live_state, ss, g, err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                continue;
+                            }
+                            state = &live_state;
+                        }
+                        const int64_t upto = (int64_t) state->ids.size();
+                        std::string why;
+                        // the write buffer, the manifest (token ids and two words a 256 KiB unit) and slack
+                        const uint64_t need = strata::core::kParkStreamBuffer + (uint64_t) upto * 4 * 2 + (8u << 20);
+                        if (!admit(need, why)) { refuse(why, strata::core::SessionError::memory); continue; }
+                        std::vector<strata::core::SessionKvSource> sources;
+                        strata::core::ParkSaveInput in;
+                        strata::core::conversation_park_meta(in.meta, ss, g, cvec_cached);
+                        if (!strata::core::conversation_park_sources(sources, ss, g, mtp.kv_state(), upto, err)) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        in.state = state;
+                        in.kv = &sources;
+                        if (park.on && park.path == path) {
+                            in.expect = park.file;
+                            in.keep_tokens = (uint64_t) std::clamp<int64_t>(park.unchanged, 0, upto);
+                        }
+                        in.keep_bytes = [&](uint64_t t, std::vector<std::array<uint64_t, 5>>& keep, std::string& e) {
+                            return strata::core::conversation_park_keep(keep, ss, g, mtp.kv_state(), upto, (int64_t) t, e);
+                        };
+                        strata::core::ParkSaveOptions po;
+                        po.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                        po.progress = moving;
+                        po.phase = blocking;
+                        if (const char* c = std::getenv("STRATA_PARK_COMPACT_MIB")) po.compact_bytes = (uint64_t) std::atoll(c) << 20;
+                        strata::core::ParkSaveResult r;
+                        strata::core::SessionStatus st;
+                        if (!strata::core::park_file_save(path, in, id, r, err, po, &st)) {
+                            if (st.published) park.on = false;   // a new file is there, its name maybe not durable
+                            refuse(err, st.error, st.published);
+                            continue;
+                        }
+                        // STRATA_PARK_VERIFY (diagnostic, tests): read the file back and compare every byte with what
+                        // the engine holds - the K/V straight from the pools, the running state - so an append that
+                        // kept old units is proven byte-identical to a whole save
+                        static const bool park_verify = std::getenv("STRATA_PARK_VERIFY") != nullptr;
+                        if (park_verify) {
+                            std::string verdict, ve;
+                            blocking("verify", r.file_bytes);
+                            strata::core::ParkImage vi;
+                            strata::core::SessionStatus vs;
+                            if (!strata::core::park_file_open(path, id, vi, ve, {}, &vs)) verdict = "open failed: " + ve;
+                            else if (vi.state.ids != state->ids || vi.state.imgs != state->imgs || vi.state.gdn != state->gdn ||
+                                     vi.state.ple != state->ple || vi.state.tails != state->tails ||
+                                     vi.state.dead != state->dead || vi.state.block_pos != state->block_pos)
+                                verdict = "running state or ids differ";
+                            else if (vi.layers.size() != sources.size()) verdict = "layer count differs";
+                            else {
+                                std::vector<uint8_t> tmp;
+                                std::vector<strata::core::SessionKvSink> cmp(sources.size());
+                                for (size_t l = 0; l < sources.size(); ++l) {
+                                    cmp[l].sizes = sources[l].sizes;
+                                    cmp[l].write = [&, l](size_t part, size_t off, const void* src, size_t n) {
+                                        tmp.resize(n);
+                                        if (!sources[l].read(part, off, tmp.data(), n)) { verdict = "pool read failed"; return false; }
+                                        if (std::memcmp(tmp.data(), src, n) != 0) {
+                                            verdict = "K/V differs: layer " + std::to_string(l) + " part " + std::to_string(part) +
+                                                      " bytes " + std::to_string(off) + "+" + std::to_string(n);
+                                            return false;
+                                        }
+                                        return true;
+                                    };
+                                }
+                                bool sf = false;
+                                if (!strata::core::park_file_stream(vi, cmp, ve, sf, {}, &vs) && verdict.empty())
+                                    verdict = "stream: " + ve;
+                            }
+                            std::fprintf(stderr, "strata serve: park verify: %s (generation %llu, %s)\n",
+                                         verdict.empty() ? "identical" : ("MISMATCH " + verdict).c_str(),
+                                         (unsigned long long) r.file.generation, r.appended ? "append" : "whole file");
+                        }
+                        park.on = true;
+                        park.path = path;
+                        park.file = r.file;
+                        park.unchanged = upto;    // the pools' first `upto` tokens are now the file's bytes
+                        park.ram_len = 0;
+                        std::fprintf(stderr, "strata serve: park saved %lld tokens (%s%s), %llu bytes written, file %llu bytes "
+                                     "(%llu unreferenced), generation %llu, in %.1f ms\n", (long long) upto,
+                                     r.appended ? "append, kept " : "whole file", r.appended ? std::to_string(r.kept_tokens).c_str()
+                                     : (": " + r.why_full).c_str(), (unsigned long long) r.written,
+                                     (unsigned long long) r.file_bytes, (unsigned long long) r.garbage,
+                                     (unsigned long long) r.file.generation, ms());
+                        std::printf("PARKED %lld %llu %.1f %llu %s\n", (long long) upto, (unsigned long long) r.written, ms(),
+                                    (unsigned long long) r.file_bytes, r.appended ? "append" : "full");
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to save the park file", strata::core::SessionError::memory);
+                        continue;
+                    }
+                } else {
+                    strata::core::ParkImage img;
+                    strata::core::SessionStatus st;
+                    try {
+                        strata::core::SessionReadLimits limits;
+                        limits.admit = admit;
+                        if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
+                                (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        if (!strata::core::park_file_open(path, id, img, err, limits, &st)) { refuse(err, st.error); continue; }
+                    } catch (const std::bad_alloc&) {
+                        refuse("not enough RAM to read the park file", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    if (!strata::core::conversation_park_validate(img.meta, img.state, img.layers, ss, g, mtp.kv_state(), err)) {
+                        refuse(err);
+                        continue;
+                    }
+                    const int64_t n_ids = (int64_t) img.state.ids.size();
+                    if (!ctx_ensure(n_ids + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                        refuse("the context state cannot grow to the parked conversation: no VRAM is left", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    if (!kvg_ensure(n_ids + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                        refuse("the K/V cannot grow to the parked conversation: no VRAM is left", strata::core::SessionError::memory);
+                        continue;
+                    }
+                    const bool was_ok = live_ok;
+                    std::string file_err;
+                    strata::core::SessionError file_kind = strata::core::SessionError::io;
+                    auto stream = [&](const std::vector<strata::core::SessionKvSink>& sinks) -> int {
+                        conversations.take_reuse();   // retained K/V described the outgoing session
+                        live_ok = false;
+                        bool sink_failed = false;
+                        strata::core::SessionStatus s2;
+                        if (strata::core::park_file_stream(img, sinks, file_err, sink_failed, moving, &s2)) return 0;
+                        file_kind = s2.error;
+                        return sink_failed ? 2 : 1;
+                    };
+                    const auto rr = strata::core::conversation_park_restore(img.state, ss, g, mtp.kv_state(), stream, err);
+                    if (rr == strata::core::ParkRestore::invalid) {   // before any device write: as it was
+                        live_ok = was_ok;
+                        refuse(err);
+                        continue;
+                    }
+                    if (rr == strata::core::ParkRestore::partial) {
+                        live.clear();
+                        live_imgs.clear();
+                        checks.clear();
+                        tail_ckpt_len = -1;
+                        live_ok = false;
+                        park.on = false;
+                        refuse(file_err + " (the K/V was being read: the live session was dropped)", file_kind);
+                        continue;
+                    }
+                    if (rr != strata::core::ParkRestore::restored) {
+                        std::fprintf(stderr, "strata serve: park load %s: transfer failed: %s %s\n", path.c_str(),
+                                     err.c_str(), file_err.c_str());
+                        std::printf("FATAL restoring the park file failed after the device state was changed: %s %s\n",
+                                    err.c_str(), file_err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    const uint64_t read_bytes = img.kv_bytes;
+                    live = std::move(img.state.ids);
+                    live_imgs = std::move(img.state.imgs);
+                    checks.clear();
+                    tail_ckpt_len = -1;
+                    cvec_cached = img.meta.cvec;
+                    live_ok = true;
+                    park.on = true;
+                    park.path = path;
+                    park.file = img.file;
+                    park.unchanged = (int64_t) live.size();
+                    park.ram_len = 0;
+                    std::fprintf(stderr, "strata serve: park loaded %zu tokens, %llu K/V bytes streamed, generation %llu, "
+                                 "in %.1f ms\n", live.size(), (unsigned long long) read_bytes,
+                                 (unsigned long long) img.file.generation, ms());
+                    std::printf("UNPARKED %zu %llu %.1f\n", live.size(), (unsigned long long) read_bytes, ms());
                 }
                 std::fflush(stdout);
                 continue;
@@ -9443,6 +9730,9 @@ int main(int argc, char** argv) {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
+                if (park.on)   // r8: the pools now hold the parked image's bytes
+                    park.unchanged = park.ram_len == incoming->live.ids.size() &&
+                                     park_ids_hash(incoming->live.ids) == park.ram_hash ? park.ram_unchanged : 0;
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
@@ -9479,6 +9769,10 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            if (park.on) {   // r8: this request writes every cell from `resume` on (a slot copy or a re-read: all)
+                static const bool reread_env = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                park.unchanged = slot_source >= 0 || reread_env ? 0 : std::min<int64_t>(park.unchanged, resume);
+            }
             if (strata::core::qsa_ctx_elastic() || (xcache.band_on() && !xcache.band_mapped())) {   // r7
                 static const bool ctx_hold = [] { const char* v = std::getenv("STRATA_CTX_GROW_HOLD"); return v == nullptr || std::atoi(v) != 0; }();
                 kv_quiesce();
